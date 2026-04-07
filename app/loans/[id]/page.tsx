@@ -84,52 +84,77 @@ export default function LoanDetailPage() {
     const disburseDate = new Date(loan.disbursement_date)
     const frequency = loan.payment_frequency || 'monthly'
     
+    const today = new Date()
     let nextDate = new Date(disburseDate)
-    let cumulativeDue = 0
-    let periodsCalculated = 0
-
-    // Find the first milestone where cumulativeDue > totalPaid
-    while (periodsCalculated < loan.loan_term_months) {
-      if (frequency === 'monthly') nextDate.setMonth(nextDate.getMonth() + 1)
-      else if (frequency === 'weekly') nextDate.setDate(nextDate.getDate() + 7)
-      else if (frequency === 'biweekly') nextDate.setDate(nextDate.getDate() + 14)
-      else if (frequency === 'quarterly') nextDate.setMonth(nextDate.getMonth() + 3)
-      else break
-
-      cumulativeDue += monthlyInstalment
-      periodsCalculated++
-
-      if (cumulativeDue > totalPaid + 0.01) { // 0.01 for floating point precision
-        break
-      }
-    }
-
-    // Find the opening balance for this specific period in the schedule
-    // A simple way is to use the amortization formula for Opening Balance of period 'n'
-    // or just calculate the principal reduction expected up to the previous period.
-    let scheduledOpeningBalance = loan.principal_amount
-    let currentPrincipal = loan.principal_amount
+    let currentActualBalance = loan.principal_amount
+    let remainingPaid = totalPaid
+    let cumulativeScheduled = 0
+    let earliestUnpaidDate: Date | null = null
     const monthlyRate = loan.interest_rate / 100 / 12
+    const breakdown: any[] = []
 
-    for (let i = 1; i < periodsCalculated; i++) {
-        const intP = currentPrincipal * monthlyRate
-        const prinP = monthlyInstalment - intP
-        currentPrincipal -= prinP
+    for (let i = 1; i <= loan.loan_term_months; i++) {
+        let milestoneDate = new Date(disburseDate)
+        if (frequency === 'monthly') milestoneDate.setMonth(milestoneDate.getMonth() + i)
+        else if (frequency === 'weekly') milestoneDate.setDate(milestoneDate.getDate() + (i * 7))
+        else if (frequency === 'biweekly') milestoneDate.setDate(milestoneDate.getDate() + (i * 14))
+        else if (frequency === 'quarterly') milestoneDate.setMonth(milestoneDate.getMonth() + (i * 3))
+
+        const milestoneInterest = (currentActualBalance * monthlyRate)
+        const milestonePrincipal = Math.max(0, monthlyInstalment - milestoneInterest)
+        
+        cumulativeScheduled += monthlyInstalment
+        
+        // Tracking how much of THIS milestone is covered by totalPaid
+        const unpaidInMilestone = Math.max(0, monthlyInstalment - remainingPaid)
+        const principalPaidInMilestone = Math.max(0, milestonePrincipal - Math.max(0, unpaidInMilestone - 0)) // Just a conceptual check
+        // Simplified: Principal only reduces if we have paid more than the interest part
+        const paidTowardPrincipal = Math.max(0, remainingPaid - milestoneInterest)
+        const principalReduction = Math.min(milestonePrincipal, paidTowardPrincipal)
+        
+        breakdown.push({
+            date: milestoneDate,
+            interest: milestoneInterest,
+            principal: milestonePrincipal,
+            openingBalance: currentActualBalance,
+            isOverdue: milestoneDate < today && unpaidInMilestone > 0.01
+        })
+
+        currentActualBalance -= principalReduction
+        remainingPaid = Math.max(0, remainingPaid - monthlyInstalment)
+
+        // Track the earliest unpaid milestone for the date display
+        if (!earliestUnpaidDate && unpaidInMilestone > 0.01) {
+            earliestUnpaidDate = milestoneDate
+        }
+
+        // We stop once we've included the FIRST milestone that is in the future
+        if (milestoneDate > today) {
+            nextDate = milestoneDate
+            break
+        }
+        
+        if (i === loan.loan_term_months) {
+            nextDate = milestoneDate
+        }
     }
-    scheduledOpeningBalance = currentPrincipal
 
-    const scheduledInterest = (scheduledOpeningBalance * monthlyRate)
-    const scheduledPrincipal = Math.max(0, monthlyInstalment - scheduledInterest)
-    const remainingAmount = Math.max(0, cumulativeDue - totalPaid)
+    const remainingAmount = Math.max(0, cumulativeScheduled - totalPaid)
+    
+    // Summary info for the current/latest period in the breakdown
+    const latest = breakdown[breakdown.length - 1] || { 
+        principal: 0, interest: 0, openingBalance: loan.principal_amount 
+    }
 
     return {
-      date: nextDate,
+      date: earliestUnpaidDate || nextDate,
       amount: remainingAmount,
       originalAmount: monthlyInstalment,
-      principal: scheduledPrincipal,
-      interest: scheduledInterest,
-      openingBalance: scheduledOpeningBalance,
-      isOverdue: nextDate < new Date() && (remainingAmount > 0.01)
+      principal: latest.principal,
+      interest: latest.interest,
+      openingBalance: latest.openingBalance,
+      isOverdue: earliestUnpaidDate ? earliestUnpaidDate < today : false,
+      breakdown: breakdown.filter(b => (b.date <= today || b.date === nextDate) && (b.isOverdue || b.date === nextDate))
     }
   }
 
@@ -246,77 +271,146 @@ export default function LoanDetailPage() {
         </div>
 
         {/* Quick Stats Overlay */}
-        <div className="grid md:grid-cols-3 gap-6 mb-8">
-          <Card className="p-6 border-l-4 border-l-primary">
-            <div className="flex items-center gap-4">
-              <div className="p-3 bg-primary/10 rounded-full text-primary">
-                <Calendar className="w-6 h-6" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground font-medium">Next Due Date</p>
-                <div className="flex items-center gap-2">
-                  <p className={cn(
-                    "text-xl font-bold",
-                    nextDue.isOverdue ? "text-red-600" : "text-foreground"
-                  )}>
-                    {nextDue.date ? format(nextDue.date, 'MMM dd, yyyy') : 'N/A'}
-                  </p>
-                  {nextDue.isOverdue && (
-                    <Badge variant="destructive" className="text-[10px] h-4 px-1 uppercase">Overdue</Badge>
-                  )}
+        {/* Quick Stats Overlay */}
+        <div className="grid md:grid-cols-3 gap-6 mb-8 items-start">
+          {/* Combined Date and Payment Status Card */}
+          <div className="flex flex-col gap-6">
+            <Card className="p-6 border-l-4 border-l-primary shadow-sm bg-slate-50/10">
+              <div className="flex flex-col gap-6">
+                {/* Next Due Date Section */}
+                <div className="flex items-center gap-4 group">
+                  <div className="p-3 bg-primary/10 rounded-full text-primary ring-4 ring-primary/5 group-hover:scale-110 transition-transform duration-300">
+                    <Calendar className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <p className="text-sm text-muted-foreground font-semibold uppercase tracking-wider">Next Due Date</p>
+                    <div className="flex items-center gap-2 mt-1">
+                      <p className={cn(
+                        "text-xl font-black tracking-tight",
+                        nextDue.isOverdue ? "text-red-600" : "text-foreground"
+                      )}>
+                        {nextDue.date ? format(nextDue.date, 'MMM dd, yyyy') : 'N/A'}
+                      </p>
+                    </div>
+                  </div>
+                </div>
+
+                {/* Divider */}
+                <div className="h-px bg-slate-100 dark:bg-slate-800" />
+
+                {/* Last Payment Section */}
+                <div className="flex items-center gap-4 group">
+                  <div className="p-3 bg-green-100 rounded-full text-green-600 ring-4 ring-green-50 group-hover:scale-110 transition-transform duration-300">
+                    <Clock className="w-6 h-6" />
+                  </div>
+                  <div>
+                    <p className="text-sm text-muted-foreground font-semibold uppercase tracking-wider">Last Payment</p>
+                    <p className="text-xl font-black text-foreground mt-1 tracking-tight">
+                      {lastPayment ? `₱${lastPayment.amount.toLocaleString()}` : 'None'}
+                    </p>
+                    {lastPayment && (
+                      <p className="text-[10px] font-bold text-muted-foreground uppercase opacity-70 mt-0.5">
+                        {format(new Date(lastPayment.payment_date), 'MMMM dd, yyyy')}
+                      </p>
+                    )}
+                  </div>
                 </div>
               </div>
-            </div>
-          </Card>
+            </Card>
+          </div>
+
+          {/* Expanded Due Amount & Breakdown Card */}
           <Card className={cn(
-            "p-6 border-l-4",
-            nextDue.isOverdue ? "border-l-red-600 bg-red-50/30" : "border-l-orange-500"
+            "p-6 border-l-4 md:col-span-2 shadow-sm transition-all duration-500",
+            nextDue.isOverdue ? "border-l-red-600 bg-red-50/20" : "border-l-orange-500 bg-orange-50/10"
           )}>
-            <div className="flex items-center gap-4">
-              <div className="p-3 bg-orange-100 rounded-full text-orange-600">
-                <DollarSign className="w-6 h-6" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground font-medium">Next Due Amount</p>
-                <p className="text-xl font-bold text-foreground">
-                  ₱{nextDue.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
-                </p>
-                <div className="flex gap-2 mt-1">
-                  <p className="text-[10px] text-muted-foreground uppercase font-semibold">
-                    ₱{nextDue.originalAmount.toLocaleString()} scheduled
+            <div className="flex flex-col">
+              <div className="flex items-center gap-4 mb-4">
+                <div className="p-3 bg-orange-100 rounded-full text-orange-600 ring-4 ring-orange-50">
+                  <DollarSign className="w-6 h-6" />
+                </div>
+                <div>
+                  <p className="text-sm text-muted-foreground font-semibold uppercase tracking-wider">Total Amount Due to Stay Current</p>
+                  <div className="flex items-baseline gap-2">
+                    <p className="text-3xl font-black text-foreground tracking-tight">
+                      ₱{nextDue.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                    </p>
+                    {nextDue.isOverdue && (
+                      <Badge variant="destructive" className="animate-pulse h-5 font-black uppercase text-[10px] tracking-widest px-2">Overdue</Badge>
+                    )}
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-1 font-medium italic opacity-70 uppercase">
+                    (Standard Scheduled: ₱{nextDue.originalAmount.toLocaleString()})
                   </p>
                 </div>
-                <div className="flex gap-3 mt-1 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
-                   <div className="flex items-center gap-1">
-                     <div className="w-1.5 h-1.5 rounded-full bg-blue-500" />
-                     <span>₱{nextDue.principal.toLocaleString(undefined, { maximumFractionDigits: 0 })} Principal</span>
-                   </div>
-                   <div className="flex items-center gap-1">
-                     <div className="w-1.5 h-1.5 rounded-full bg-orange-500" />
-                     <span>₱{nextDue.interest.toLocaleString(undefined, { maximumFractionDigits: 0 })} Interest</span>
-                     <span className="text-[8px] opacity-70 ml-1">
-                       (₱{nextDue.openingBalance?.toLocaleString()} × {(loan.interest_rate/12).toFixed(1)}%)
-                     </span>
-                   </div>
-                </div>
               </div>
-            </div>
-          </Card>
-          <Card className="p-6 border-l-4 border-l-green-500">
-            <div className="flex items-center gap-4">
-              <div className="p-3 bg-green-100 rounded-full text-green-600">
-                <Clock className="w-6 h-6" />
-              </div>
-              <div>
-                <p className="text-sm text-muted-foreground font-medium">Last Payment</p>
-                <p className="text-xl font-bold text-foreground">
-                  {lastPayment ? `₱${lastPayment.amount.toLocaleString()}` : 'None'}
-                </p>
-                {lastPayment && (
-                  <p className="text-xs text-muted-foreground">
-                    {format(new Date(lastPayment.payment_date), 'MMM dd')}
-                  </p>
-                )}
+
+              {/* Detailed Due Breakdown */}
+              <div className="flex flex-col gap-3 mt-4 pt-6 border-t border-slate-200 dark:border-slate-800">
+                 <div className="flex items-center justify-between mb-2">
+                    <div className="flex items-center gap-3">
+                      <p className="text-[12px] font-black text-slate-700 dark:text-slate-300 uppercase tracking-[0.15em]">Detailed Breakdown</p>
+                      <div className="h-4 w-px bg-slate-300 dark:bg-slate-700" />
+                      <span className="text-[11px] font-bold text-slate-500 italic opacity-70">Catch-up Summary</span>
+                    </div>
+                    <Badge variant="outline" className="text-[10px] font-black h-5 border-slate-300 text-slate-500 bg-white/50 backdrop-blur-sm px-2">
+                      {nextDue.breakdown.length} Periods
+                    </Badge>
+                 </div>
+                 
+                 <div className="relative space-y-5 before:absolute before:left-[11px] before:top-2 before:bottom-2 before:w-px before:bg-slate-200 dark:before:bg-slate-800">
+                   {nextDue?.breakdown?.map((item: any, idx: number) => (
+                     <div key={idx} className="relative pl-8 flex justify-between items-center group transition-all duration-300 hover:translate-x-1">
+                       {/* Status Dot Indicator */}
+                       <div className={cn(
+                         "absolute left-0 top-[2px] w-[22px] h-[22px] rounded-full border-4 border-white dark:border-slate-950 flex items-center justify-center shadow-lg transform transition-transform group-hover:scale-125 z-10",
+                         item.isOverdue ? "bg-red-500" : "bg-blue-500"
+                       )}>
+                          <div className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                       </div>
+
+                       <div className="flex flex-col">
+                         <span className="text-[14px] font-black text-foreground tracking-tight leading-none">
+                           {format(item.date, 'MMMM dd, yyyy')}
+                         </span>
+                         <div className="flex items-center gap-2 mt-2">
+                           <span className={cn(
+                             "text-[9px] font-black uppercase px-2 py-0.5 rounded shadow-sm tracking-widest",
+                             item.isOverdue ? "bg-red-600 text-white" : "bg-blue-600 text-white"
+                           )}>
+                             {item.isOverdue ? 'Overdue' : 'Upcoming'}
+                           </span>
+                           <div className="h-1 w-1 rounded-full bg-slate-300" />
+                           <span className="text-[9px] text-muted-foreground font-bold tracking-tight opacity-80 uppercase">
+                             Opening: ₱{item.openingBalance?.toLocaleString()}
+                           </span>
+                         </div>
+                       </div>
+
+                       <div className="text-right">
+                         <div className="flex items-center gap-6 justify-end">
+                           <div className="flex gap-4">
+                             <div className="flex flex-col items-end">
+                               <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Principal</p>
+                               <span className="text-[13px] font-black text-blue-600">₱{item.principal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                             </div>
+                             <div className="flex flex-col items-end">
+                               <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Interest</p>
+                               <span className="text-[13px] font-black text-orange-500">₱{item.interest.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
+                             </div>
+                           </div>
+                           <div className="h-10 w-px bg-slate-200 dark:bg-slate-800" />
+                           <div className="flex flex-col items-end">
+                             <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Total</p>
+                             <div className="text-[16px] font-black text-foreground tracking-tighter">
+                               ₱{(item.principal + item.interest).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                             </div>
+                           </div>
+                         </div>
+                       </div>
+                     </div>
+                   ))}
+                 </div>
               </div>
             </div>
           </Card>
