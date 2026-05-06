@@ -72,7 +72,7 @@ export default function LoanDetailPage() {
   }, [loanId])
 
   const calculateNextDue = () => {
-    if (!loan) return { date: null, amount: 0, originalAmount: 0, principal: 0, interest: 0, openingBalance: 0, isOverdue: false }
+    if (!loan) return { date: null, amount: 0, originalAmount: 0, principal: 0, interest: 0, openingBalance: 0, isOverdue: false, breakdown: [] }
 
     const monthlyInstalment = calculateMonthlyPayment(
       loan.principal_amount,
@@ -105,22 +105,30 @@ export default function LoanDetailPage() {
         
         cumulativeScheduled += monthlyInstalment
         
-        // Tracking how much of THIS milestone is covered by totalPaid
-        const unpaidInMilestone = Math.max(0, monthlyInstalment - remainingPaid)
-        const principalPaidInMilestone = Math.max(0, milestonePrincipal - Math.max(0, unpaidInMilestone - 0)) // Just a conceptual check
-        // Simplified: Principal only reduces if we have paid more than the interest part
-        const paidTowardPrincipal = Math.max(0, remainingPaid - milestoneInterest)
-        const principalReduction = Math.min(milestonePrincipal, paidTowardPrincipal)
+        const paymentApplied = Math.min(remainingPaid, monthlyInstalment)
+        const paidTowardInterest = Math.min(paymentApplied, milestoneInterest)
+        const paidTowardPrincipal = Math.min(
+          milestonePrincipal,
+          Math.max(0, paymentApplied - paidTowardInterest)
+        )
+        const remainingInterest = Math.max(0, milestoneInterest - paidTowardInterest)
+        const remainingPrincipal = Math.max(0, milestonePrincipal - paidTowardPrincipal)
+        const unpaidInMilestone = remainingInterest + remainingPrincipal
         
         breakdown.push({
             date: milestoneDate,
-            interest: milestoneInterest,
-            principal: milestonePrincipal,
+            interest: remainingInterest,
+            principal: remainingPrincipal,
+            scheduledInterest: milestoneInterest,
+            scheduledPrincipal: milestonePrincipal,
+            scheduledAmount: monthlyInstalment,
+            paidAmount: paymentApplied,
+            remainingDue: unpaidInMilestone,
             openingBalance: currentActualBalance,
             isOverdue: milestoneDate < today && unpaidInMilestone > 0.01
         })
 
-        currentActualBalance -= principalReduction
+        currentActualBalance -= paidTowardPrincipal
         remainingPaid = Math.max(0, remainingPaid - monthlyInstalment)
 
         // Track the earliest unpaid milestone for the date display
@@ -154,7 +162,7 @@ export default function LoanDetailPage() {
       interest: latest.interest,
       openingBalance: latest.openingBalance,
       isOverdue: earliestUnpaidDate ? earliestUnpaidDate < today : false,
-      breakdown: breakdown.filter(b => (b.date <= today || b.date === nextDate) && (b.isOverdue || b.date === nextDate))
+      breakdown: breakdown.filter(b => (b.date <= today || b.date === nextDate) && b.remainingDue > 0.01)
     }
   }
 
@@ -384,6 +392,17 @@ export default function LoanDetailPage() {
                            <span className="text-[9px] text-muted-foreground font-bold tracking-tight opacity-80 uppercase">
                              Opening: ₱{item.openingBalance?.toLocaleString()}
                            </span>
+                           {item.paidAmount > 0 && (
+                             <>
+                               <div className="h-1 w-1 rounded-full bg-slate-300" />
+                               <span className="text-[9px] text-emerald-700 font-bold tracking-tight opacity-80 uppercase">
+                                 Paid: ₱{item.paidAmount.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                               </span>
+                             </>
+                           )}
+                         </div>
+                         <div className="mt-1 text-[9px] text-muted-foreground font-bold tracking-tight opacity-70 uppercase">
+                           Scheduled: ₱{item.scheduledAmount.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                          </div>
                        </div>
 
@@ -401,9 +420,9 @@ export default function LoanDetailPage() {
                            </div>
                            <div className="h-10 w-px bg-slate-200 dark:bg-slate-800" />
                            <div className="flex flex-col items-end">
-                             <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Total</p>
+                             <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Due</p>
                              <div className="text-[16px] font-black text-foreground tracking-tighter">
-                               ₱{(item.principal + item.interest).toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                               ₱{item.remainingDue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                              </div>
                            </div>
                          </div>
