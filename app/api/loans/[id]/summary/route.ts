@@ -1,4 +1,3 @@
-import getDb from '@/lib/db'
 import { getLoanSummary } from '@/lib/loan-service'
 import { NextRequest, NextResponse } from 'next/server'
 

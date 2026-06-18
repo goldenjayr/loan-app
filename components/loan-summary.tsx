@@ -39,6 +39,8 @@ export default function LoanSummary({ loanId, loan }: LoanSummaryProps) {
 
   if (!summary) return null
 
+  const peso = (n: number) =>
+    `₱${Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
   const percentPaid = ((summary.totalPaid / (summary.loanAmount || 1)) * 100).toFixed(1)
 
   return (
@@ -55,11 +57,13 @@ export default function LoanSummary({ loanId, loan }: LoanSummaryProps) {
         <div className="grid grid-cols-2 gap-4 pb-4 border-b border-border">
           <div>
             <p className="text-xs text-muted-foreground font-semibold uppercase tracking-tight mb-1">Loan Principal</p>
-            <p className="text-xl font-bold text-foreground">₱{summary.loanAmount?.toLocaleString()}</p>
+            <p className="text-xl font-bold text-foreground">{peso(summary.loanAmount)}</p>
+            <p className="text-[10px] text-muted-foreground opacity-70 mt-0.5">Amount originally borrowed</p>
           </div>
           <div>
             <p className="text-xs text-muted-foreground font-semibold uppercase tracking-tight mb-1">Amount Paid</p>
-            <p className="text-xl font-bold text-green-600">₱{summary.totalPaid?.toLocaleString()}</p>
+            <p className="text-xl font-bold text-green-600">{peso(summary.totalPaid)}</p>
+            <p className="text-[10px] text-muted-foreground opacity-70 mt-0.5">Total received so far</p>
           </div>
         </div>
 
@@ -68,21 +72,25 @@ export default function LoanSummary({ loanId, loan }: LoanSummaryProps) {
             <div className="flex justify-between items-center">
               <div>
                 <p className="text-sm text-muted-foreground">Accrued Interest</p>
-                {summary.calculationNotes && (
-                  <p className="text-[10px] text-muted-foreground opacity-70">
-                    {summary.calculationNotes.interestFormula}
-                  </p>
-                )}
+                <p className="text-[10px] text-muted-foreground opacity-70">
+                  {summary.calculationNotes?.interestFormula || 'Interest charged but not yet paid'}
+                </p>
               </div>
-              <p className="font-semibold text-foreground">₱{summary.accruredInterest.toLocaleString()}</p>
+              <p className="font-semibold text-foreground">{peso(summary.accruredInterest)}</p>
             </div>
           <div className="flex justify-between items-center text-sm">
-            <p className="text-muted-foreground">Total Penalties</p>
-            <p className="font-semibold text-red-600">₱{summary.penalties?.toLocaleString()}</p>
+            <div>
+              <p className="text-muted-foreground">Total Penalties</p>
+              <p className="text-[10px] text-muted-foreground opacity-70">Late fees, if any</p>
+            </div>
+            <p className="font-semibold text-red-600">{peso(summary.penalties)}</p>
           </div>
-          <div className="flex justify-between items-center text-sm pt-1">
-            <p className="font-bold text-foreground text-base">Total Due Amount</p>
-            <p className="font-bold text-orange-600 text-lg">₱{summary.totalDue?.toLocaleString()}</p>
+          <div className="flex justify-between items-center pt-1">
+            <div>
+              <p className="font-bold text-foreground text-base">Total Due Amount</p>
+              <p className="text-[10px] text-muted-foreground opacity-70">Full payoff today = balance + interest + penalties</p>
+            </div>
+            <p className="font-bold text-orange-600 text-lg">{peso(summary.totalDue)}</p>
           </div>
         </div>
 

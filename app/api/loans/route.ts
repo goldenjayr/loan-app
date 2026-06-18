@@ -1,4 +1,5 @@
 import getDb from '@/lib/db'
+import { money } from '@/lib/money'
 import { NextRequest, NextResponse } from 'next/server'
 
 export async function GET(request: NextRequest) {
@@ -57,12 +58,38 @@ export async function POST(request: NextRequest) {
       )
     }
 
+    const amount = money(parseFloat(loan_amount))
+    const rate = parseFloat(interest_rate)
+    const term = parseInt(loan_term_months)
+    const penalty = parseFloat(penalty_per_day || 0)
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return NextResponse.json({ error: 'Loan amount must be a positive number' }, { status: 400 })
+    }
+    if (!Number.isFinite(rate) || rate < 0) {
+      return NextResponse.json({ error: 'Interest rate must be zero or a positive number' }, { status: 400 })
+    }
+    if (!Number.isInteger(term) || term <= 0) {
+      return NextResponse.json({ error: 'Loan term must be a positive whole number of months' }, { status: 400 })
+    }
+    if (!Number.isFinite(penalty) || penalty < 0) {
+      return NextResponse.json({ error: 'Penalty per day must be zero or a positive number' }, { status: 400 })
+    }
+    if (isNaN(new Date(disbursement_date).getTime())) {
+      return NextResponse.json({ error: 'Invalid disbursement date' }, { status: 400 })
+    }
+
     const db = getDb()
-    
-    // Calculate maturity date (simple addition of months for now)
+
+    // Calculate maturity date (clamps month-end overflow, e.g. Jan 31 + 1mo -> Feb 28).
     const disburseDate = new Date(disbursement_date)
     const maturityDate = new Date(disburseDate)
-    maturityDate.setMonth(maturityDate.getMonth() + parseInt(loan_term_months))
+    const targetDay = maturityDate.getDate()
+    maturityDate.setMonth(maturityDate.getMonth() + term)
+    if (maturityDate.getDate() < targetDay) {
+      // Overflowed into the next month; back up to the last day of the intended month.
+      maturityDate.setDate(0)
+    }
     const maturity_date = maturityDate.toISOString().split('T')[0]
 
     const stmt = db.prepare(`
@@ -74,20 +101,19 @@ export async function POST(request: NextRequest) {
     `)
 
     const now = new Date().toISOString()
-    const amount = parseFloat(loan_amount)
-    
+
     const result = stmt.run(
       parseInt(borrower_id),
       amount, // principal_amount
       amount, // loan_amount
       amount, // balance (initial)
-      parseFloat(interest_rate),
+      rate,
       interest_type || 'simple',
-      parseInt(loan_term_months),
+      term,
       disbursement_date,
       maturity_date,
       payment_frequency || 'monthly',
-      parseFloat(penalty_per_day || 0),
+      penalty,
       'active',
       notes || null,
       now,

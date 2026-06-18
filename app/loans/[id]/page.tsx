@@ -10,9 +10,8 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import LoanSummary from '@/components/loan-summary'
 import PaymentsList from '@/components/payments-list'
-import { ArrowLeft, Calendar, DollarSign, Clock, Trash2 } from 'lucide-react'
+import { ArrowLeft, Calendar, DollarSign, Clock, Trash2, Pencil } from 'lucide-react'
 import Link from 'next/link'
-import { calculateMonthlyPayment } from '@/lib/calculations'
 import { format } from 'date-fns'
 import { cn } from '@/lib/utils'
 import {
@@ -36,6 +35,7 @@ export default function LoanDetailPage() {
   const [user, setUser] = useState<any>(null)
   const [loan, setLoan] = useState<any>(null)
   const [payments, setPayments] = useState<any[]>([])
+  const [summary, setSummary] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [deleting, setDeleting] = useState(false)
 
@@ -50,11 +50,14 @@ export default function LoanDetailPage() {
 
       setUser(user)
 
-      // Fetch loan details
-      const loansResponse = await fetch('/api/loans')
-      if (loansResponse.ok) {
-        const loansData = await loansResponse.json()
-        const selectedLoan = loansData.find((l: any) => l.id === Number(loanId))
+      // Bring interest/penalties/status up to date (explicit write), then read.
+      // Idempotent, so safe to run on every view.
+      await fetch(`/api/loans/${loanId}/accrue`, { method: 'POST' }).catch(() => {})
+
+      // Fetch this loan only (no longer pulls every loan to the client).
+      const loanResponse = await fetch(`/api/loans/${loanId}`)
+      if (loanResponse.ok) {
+        const selectedLoan = await loanResponse.json()
         setLoan(selectedLoan)
       }
 
@@ -65,107 +68,17 @@ export default function LoanDetailPage() {
         setPayments(paymentsData)
       }
 
+      // Engine-derived summary + statement (single source of truth for "due").
+      const summaryResponse = await fetch(`/api/loans/${loanId}/summary`)
+      if (summaryResponse.ok) {
+        setSummary(await summaryResponse.json())
+      }
+
       setLoading(false)
     }
 
     checkAuth()
   }, [loanId])
-
-  const calculateNextDue = () => {
-    if (!loan) return { date: null, amount: 0, originalAmount: 0, principal: 0, interest: 0, openingBalance: 0, isOverdue: false, breakdown: [] }
-
-    const monthlyInstalment = calculateMonthlyPayment(
-      loan.principal_amount,
-      loan.interest_rate,
-      loan.loan_term_months
-    )
-
-    const totalPaid = payments.reduce((sum, p: any) => sum + p.amount, 0)
-    const disburseDate = new Date(loan.disbursement_date)
-    const frequency = loan.payment_frequency || 'monthly'
-    
-    const today = new Date()
-    let nextDate = new Date(disburseDate)
-    let currentActualBalance = loan.principal_amount
-    let remainingPaid = totalPaid
-    let cumulativeScheduled = 0
-    let earliestUnpaidDate: Date | null = null
-    const monthlyRate = loan.interest_rate / 100 / 12
-    const breakdown: any[] = []
-
-    for (let i = 1; i <= loan.loan_term_months; i++) {
-        let milestoneDate = new Date(disburseDate)
-        if (frequency === 'monthly') milestoneDate.setMonth(milestoneDate.getMonth() + i)
-        else if (frequency === 'weekly') milestoneDate.setDate(milestoneDate.getDate() + (i * 7))
-        else if (frequency === 'biweekly') milestoneDate.setDate(milestoneDate.getDate() + (i * 14))
-        else if (frequency === 'quarterly') milestoneDate.setMonth(milestoneDate.getMonth() + (i * 3))
-
-        const milestoneInterest = (currentActualBalance * monthlyRate)
-        const milestonePrincipal = Math.max(0, monthlyInstalment - milestoneInterest)
-        
-        cumulativeScheduled += monthlyInstalment
-        
-        const paymentApplied = Math.min(remainingPaid, monthlyInstalment)
-        const paidTowardInterest = Math.min(paymentApplied, milestoneInterest)
-        const paidTowardPrincipal = Math.min(
-          milestonePrincipal,
-          Math.max(0, paymentApplied - paidTowardInterest)
-        )
-        const remainingInterest = Math.max(0, milestoneInterest - paidTowardInterest)
-        const remainingPrincipal = Math.max(0, milestonePrincipal - paidTowardPrincipal)
-        const unpaidInMilestone = remainingInterest + remainingPrincipal
-        
-        breakdown.push({
-            date: milestoneDate,
-            interest: remainingInterest,
-            principal: remainingPrincipal,
-            scheduledInterest: milestoneInterest,
-            scheduledPrincipal: milestonePrincipal,
-            scheduledAmount: monthlyInstalment,
-            paidAmount: paymentApplied,
-            remainingDue: unpaidInMilestone,
-            openingBalance: currentActualBalance,
-            isOverdue: milestoneDate < today && unpaidInMilestone > 0.01
-        })
-
-        currentActualBalance -= paidTowardPrincipal
-        remainingPaid = Math.max(0, remainingPaid - monthlyInstalment)
-
-        // Track the earliest unpaid milestone for the date display
-        if (!earliestUnpaidDate && unpaidInMilestone > 0.01) {
-            earliestUnpaidDate = milestoneDate
-        }
-
-        // We stop once we've included the FIRST milestone that is in the future
-        if (milestoneDate > today) {
-            nextDate = milestoneDate
-            break
-        }
-        
-        if (i === loan.loan_term_months) {
-            nextDate = milestoneDate
-        }
-    }
-
-    const remainingAmount = Math.max(0, cumulativeScheduled - totalPaid)
-    
-    // Summary info for the current/latest period in the breakdown
-    const latest = breakdown[breakdown.length - 1] || { 
-        principal: 0, interest: 0, openingBalance: loan.principal_amount 
-    }
-
-    return {
-      date: earliestUnpaidDate || nextDate,
-      amount: remainingAmount,
-      originalAmount: monthlyInstalment,
-      principal: latest.principal,
-      interest: latest.interest,
-      openingBalance: latest.openingBalance,
-      isOverdue: earliestUnpaidDate ? earliestUnpaidDate < today : false,
-      breakdown: breakdown.filter(b => (b.date <= today || b.date === nextDate) && b.remainingDue > 0.01)
-    }
-  }
-
 
   const handleDelete = async () => {
     setDeleting(true)
@@ -189,7 +102,9 @@ export default function LoanDetailPage() {
     }
   }
 
-  const nextDue = calculateNextDue()
+  const peso = (n: number) =>
+    `₱${Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
+  const statement = summary?.statement
   const lastPayment = payments.length > 0 ? payments[0] : null
 
   const getStatusColor = (status: string) => {
@@ -246,6 +161,11 @@ export default function LoanDetailPage() {
             <p className="text-muted-foreground mt-1">{loan.borrower?.email}</p>
           </div>
           <div className="flex gap-2 items-center">
+            <Link href={`/loans/${loanId}/edit`}>
+              <Button variant="outline" size="icon" className="shadow-none">
+                <Pencil className="w-4 h-4" />
+              </Button>
+            </Link>
             <AlertDialog>
               <AlertDialogTrigger asChild>
                 <Button variant="outline" size="icon" className="text-destructive border-destructive hover:bg-destructive shadow-none bg-transparent hover:text-white group">
@@ -295,9 +215,9 @@ export default function LoanDetailPage() {
                     <div className="flex items-center gap-2 mt-1">
                       <p className={cn(
                         "text-xl font-black tracking-tight",
-                        nextDue.isOverdue ? "text-red-600" : "text-foreground"
+                        statement?.isOverdue ? "text-red-600" : "text-foreground"
                       )}>
-                        {nextDue.date ? format(nextDue.date, 'MMM dd, yyyy') : 'N/A'}
+                        {statement?.nextDueDate ? format(new Date(statement.nextDueDate), 'MMM dd, yyyy') : 'N/A'}
                       </p>
                     </div>
                   </div>
@@ -314,7 +234,7 @@ export default function LoanDetailPage() {
                   <div>
                     <p className="text-sm text-muted-foreground font-semibold uppercase tracking-wider">Last Payment</p>
                     <p className="text-xl font-black text-foreground mt-1 tracking-tight">
-                      {lastPayment ? `₱${lastPayment.amount.toLocaleString()}` : 'None'}
+                      {lastPayment ? peso(lastPayment.amount) : 'None'}
                     </p>
                     {lastPayment && (
                       <p className="text-[10px] font-bold text-muted-foreground uppercase opacity-70 mt-0.5">
@@ -327,10 +247,10 @@ export default function LoanDetailPage() {
             </Card>
           </div>
 
-          {/* Expanded Due Amount & Breakdown Card */}
+          {/* Amount Due to Stay Current — driven entirely by the engine statement */}
           <Card className={cn(
             "p-6 border-l-4 md:col-span-2 shadow-sm transition-all duration-500",
-            nextDue.isOverdue ? "border-l-red-600 bg-red-50/20" : "border-l-orange-500 bg-orange-50/10"
+            statement?.isOverdue ? "border-l-red-600 bg-red-50/20" : "border-l-orange-500 bg-orange-50/10"
           )}>
             <div className="flex flex-col">
               <div className="flex items-center gap-4 mb-4">
@@ -338,99 +258,232 @@ export default function LoanDetailPage() {
                   <DollarSign className="w-6 h-6" />
                 </div>
                 <div>
-                  <p className="text-sm text-muted-foreground font-semibold uppercase tracking-wider">Total Amount Due to Stay Current</p>
+                  <p className="text-sm text-muted-foreground font-semibold uppercase tracking-wider">Amount Due to Stay Current</p>
                   <div className="flex items-baseline gap-2">
                     <p className="text-3xl font-black text-foreground tracking-tight">
-                      ₱{nextDue.amount.toLocaleString(undefined, { minimumFractionDigits: 2 })}
+                      {peso(statement?.amountDueToStayCurrent ?? 0)}
                     </p>
-                    {nextDue.isOverdue && (
+                    {statement?.isOverdue ? (
                       <Badge variant="destructive" className="animate-pulse h-5 font-black uppercase text-[10px] tracking-widest px-2">Overdue</Badge>
+                    ) : (
+                      <Badge variant="outline" className="h-5 font-black uppercase text-[10px] tracking-widest px-2 border-green-500 text-green-700">Current</Badge>
                     )}
                   </div>
-                  <p className="text-[11px] text-muted-foreground mt-1 font-medium italic opacity-70 uppercase">
-                    (Standard Scheduled: ₱{nextDue.originalAmount.toLocaleString()})
+                  <p className="text-xs text-muted-foreground mt-1 leading-relaxed max-w-xl">
+                    This is the <span className="font-semibold text-foreground">unpaid interest</span> {peso(statement?.accruedInterest ?? 0)}
+                    {(statement?.penalties ?? 0) > 0 && <> plus penalties {peso(statement?.penalties ?? 0)}</>} owed right now.
+                    Paying it keeps the loan in good standing, but <span className="font-semibold">does not reduce the {peso(statement?.outstandingBalance ?? 0)} you still owe</span>.
                   </p>
                 </div>
               </div>
 
-              {/* Detailed Due Breakdown */}
+              {/* Plain-language payment guide */}
+              <div className="grid sm:grid-cols-3 gap-3 mb-2">
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 bg-white/40 dark:bg-slate-900/30">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-500">Minimum (interest only)</p>
+                  <p className="text-lg font-black text-foreground mt-1">{peso(statement?.monthlyInterest ?? 0)}<span className="text-[10px] font-bold text-muted-foreground">/mo</span></p>
+                  <p className="text-[10px] text-muted-foreground mt-1 leading-snug">Covers this month's interest only. Your balance stays the same.</p>
+                </div>
+                <div className="rounded-xl border-2 border-primary/40 p-3 bg-primary/5">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-primary">Recommended installment</p>
+                  <p className="text-lg font-black text-foreground mt-1">{peso(statement?.suggestedMonthlyPayment ?? 0)}<span className="text-[10px] font-bold text-muted-foreground">/mo</span></p>
+                  <p className="text-[10px] text-muted-foreground mt-1 leading-snug">Pays the loan off in {statement?.termMonths ?? loan.loan_term_months} months. Interest shrinks each month.</p>
+                </div>
+                <div className="rounded-xl border border-slate-200 dark:border-slate-800 p-3 bg-white/40 dark:bg-slate-900/30">
+                  <p className="text-[10px] font-black uppercase tracking-wider text-slate-500">Pay off in full today</p>
+                  <p className="text-lg font-black text-foreground mt-1">{peso(statement?.payoffToday ?? 0)}</p>
+                  <p className="text-[10px] text-muted-foreground mt-1 leading-snug">Clears principal + interest. The loan closes.</p>
+                </div>
+              </div>
+
+              {/* Per-period interest statement (from the engine's own accrual rows) */}
               <div className="flex flex-col gap-3 mt-4 pt-6 border-t border-slate-200 dark:border-slate-800">
                  <div className="flex items-center justify-between mb-2">
                     <div className="flex items-center gap-3">
-                      <p className="text-[12px] font-black text-slate-700 dark:text-slate-300 uppercase tracking-[0.15em]">Detailed Breakdown</p>
+                      <p className="text-[12px] font-black text-slate-700 dark:text-slate-300 uppercase tracking-[0.15em]">Interest Statement</p>
                       <div className="h-4 w-px bg-slate-300 dark:bg-slate-700" />
-                      <span className="text-[11px] font-bold text-slate-500 italic opacity-70">Catch-up Summary</span>
+                      <span className="text-[11px] font-bold text-slate-500 italic opacity-70">Reducing balance</span>
                     </div>
                     <Badge variant="outline" className="text-[10px] font-black h-5 border-slate-300 text-slate-500 bg-white/50 backdrop-blur-sm px-2">
-                      {nextDue.breakdown.length} Periods
+                      {statement?.periods?.length ?? 0} Periods
                     </Badge>
                  </div>
-                 
+
+                 <p className="text-[11px] text-muted-foreground mb-3 leading-relaxed">
+                   Each month, interest is charged at <span className="font-semibold text-foreground">{statement?.monthlyRatePct ?? 0}% of your remaining balance</span> (reducing balance).
+                   As you pay down the principal, the monthly interest gets smaller.
+                   <span className="text-emerald-700 dark:text-emerald-400 font-semibold"> Paid</span> = interest settled,
+                   <span className="text-red-600 font-semibold"> Overdue</span> = a past month still unpaid,
+                   <span className="text-blue-600 font-semibold"> Due</span> = upcoming.
+                 </p>
+
+                 {(!statement?.periods || statement.periods.length === 0) ? (
+                   <p className="text-sm text-muted-foreground italic py-2">No interest charged yet.</p>
+                 ) : (
                  <div className="relative space-y-5 before:absolute before:left-[11px] before:top-2 before:bottom-2 before:w-px before:bg-slate-200 dark:before:bg-slate-800">
-                   {nextDue?.breakdown?.map((item: any, idx: number) => (
+                   {statement.periods.map((item: any, idx: number) => {
+                     const isOverdue = item.status === 'overdue'
+                     const isPaid = item.status === 'paid'
+                     return (
                      <div key={idx} className="relative pl-8 flex justify-between items-center group transition-all duration-300 hover:translate-x-1">
                        {/* Status Dot Indicator */}
                        <div className={cn(
                          "absolute left-0 top-[2px] w-[22px] h-[22px] rounded-full border-4 border-white dark:border-slate-950 flex items-center justify-center shadow-lg transform transition-transform group-hover:scale-125 z-10",
-                         item.isOverdue ? "bg-red-500" : "bg-blue-500"
+                         isOverdue ? "bg-red-500" : isPaid ? "bg-emerald-500" : "bg-blue-500"
                        )}>
-                          <div className="w-1.5 h-1.5 rounded-full bg-white animate-pulse" />
+                          <div className="w-1.5 h-1.5 rounded-full bg-white" />
                        </div>
 
                        <div className="flex flex-col">
                          <span className="text-[14px] font-black text-foreground tracking-tight leading-none">
-                           {format(item.date, 'MMMM dd, yyyy')}
+                           {format(new Date(item.date), 'MMMM dd, yyyy')}
                          </span>
                          <div className="flex items-center gap-2 mt-2">
                            <span className={cn(
-                             "text-[9px] font-black uppercase px-2 py-0.5 rounded shadow-sm tracking-widest",
-                             item.isOverdue ? "bg-red-600 text-white" : "bg-blue-600 text-white"
+                             "text-[9px] font-black uppercase px-2 py-0.5 rounded shadow-sm tracking-widest text-white",
+                             isOverdue ? "bg-red-600" : isPaid ? "bg-emerald-600" : "bg-blue-600"
                            )}>
-                             {item.isOverdue ? 'Overdue' : 'Upcoming'}
+                             {isOverdue ? 'Overdue' : isPaid ? 'Paid' : 'Due'}
                            </span>
                            <div className="h-1 w-1 rounded-full bg-slate-300" />
                            <span className="text-[9px] text-muted-foreground font-bold tracking-tight opacity-80 uppercase">
-                             Opening: ₱{item.openingBalance?.toLocaleString()}
+                             Opening: {peso(item.openingBalance)}
                            </span>
-                           {item.paidAmount > 0 && (
+                           {item.interestPaid > 0 && (
                              <>
                                <div className="h-1 w-1 rounded-full bg-slate-300" />
                                <span className="text-[9px] text-emerald-700 font-bold tracking-tight opacity-80 uppercase">
-                                 Paid: ₱{item.paidAmount.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                                 Paid: {peso(item.interestPaid)}
                                </span>
                              </>
                            )}
-                         </div>
-                         <div className="mt-1 text-[9px] text-muted-foreground font-bold tracking-tight opacity-70 uppercase">
-                           Scheduled: ₱{item.scheduledAmount.toLocaleString(undefined, { maximumFractionDigits: 0 })}
                          </div>
                        </div>
 
                        <div className="text-right">
                          <div className="flex items-center gap-6 justify-end">
-                           <div className="flex gap-4">
-                             <div className="flex flex-col items-end">
-                               <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Principal</p>
-                               <span className="text-[13px] font-black text-blue-600">₱{item.principal.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                             </div>
-                             <div className="flex flex-col items-end">
-                               <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Interest</p>
-                               <span className="text-[13px] font-black text-orange-500">₱{item.interest.toLocaleString(undefined, { maximumFractionDigits: 0 })}</span>
-                             </div>
+                           <div className="flex flex-col items-end">
+                             <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Interest Charged</p>
+                             <span className="text-[13px] font-black text-orange-500">{peso(item.interestCharged)}</span>
                            </div>
                            <div className="h-10 w-px bg-slate-200 dark:bg-slate-800" />
                            <div className="flex flex-col items-end">
-                             <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Due</p>
+                             <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Still Due</p>
                              <div className="text-[16px] font-black text-foreground tracking-tighter">
-                               ₱{item.remainingDue.toLocaleString(undefined, { maximumFractionDigits: 0 })}
+                               {peso(item.interestRemaining)}
                              </div>
                            </div>
                          </div>
                        </div>
                      </div>
-                   ))}
+                     )
+                   })}
                  </div>
+                 )}
               </div>
+
+              {/* Where each payment went (waterfall split) */}
+              {summary?.paymentBreakdown?.items?.length > 0 && (
+                <div className="flex flex-col gap-3 mt-6 pt-6 border-t border-slate-200 dark:border-slate-800">
+                  <div className="flex items-center justify-between mb-1">
+                    <p className="text-[12px] font-black text-slate-700 dark:text-slate-300 uppercase tracking-[0.15em]">Where Your Payments Went</p>
+                    <Badge variant="outline" className="text-[10px] font-black h-5 border-slate-300 text-slate-500 bg-white/50 backdrop-blur-sm px-2">
+                      {summary.paymentBreakdown.items.length} Payments
+                    </Badge>
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mb-2 leading-relaxed">
+                    Every payment is split in this order: <span className="font-semibold text-red-600">penalties</span> →
+                    <span className="font-semibold text-orange-500"> interest</span> →
+                    <span className="font-semibold text-blue-600"> principal</span>. Only the principal part actually lowers what you owe.
+                  </p>
+
+                  {/* Header row */}
+                  <div className="hidden sm:grid grid-cols-12 gap-2 px-3 text-[9px] font-black uppercase tracking-wider text-slate-400">
+                    <span className="col-span-3">Date</span>
+                    <span className="col-span-2 text-right">Paid</span>
+                    {summary.paymentBreakdown.totalToPenalty > 0 && <span className="col-span-2 text-right">→ Penalty</span>}
+                    <span className={cn("text-right", summary.paymentBreakdown.totalToPenalty > 0 ? "col-span-1" : "col-span-2")}>→ Interest</span>
+                    <span className="col-span-2 text-right">→ Principal</span>
+                    <span className="col-span-2 text-right">Balance After</span>
+                  </div>
+
+                  <div className="space-y-2">
+                    {summary.paymentBreakdown.items.map((p: any) => {
+                      const hasPenaltyCol = summary.paymentBreakdown.totalToPenalty > 0
+                      let note: React.ReactNode = null
+                      if (p.fullyConsumedByInterest) {
+                        note = (
+                          <>Interest had piled up to <span className="font-bold text-orange-500">{peso(p.interestDueBefore)}</span> (no payment for a while), so this entire payment went to interest — <span className="font-bold">₱0.00 reduced the balance</span>.</>
+                        )
+                      } else if (p.toInterest <= 0.005 && p.toPenalty <= 0.005) {
+                        note = <>No interest was due yet, so the whole payment reduced the principal.</>
+                      } else if (p.toInterest > 0.005 && p.toPrincipal > 0.005) {
+                        note = (
+                          <>Cleared <span className="font-bold text-orange-500">{peso(p.toInterest)}</span> of interest first, then <span className="font-bold text-blue-600">{peso(p.toPrincipal)}</span> reduced the principal.</>
+                        )
+                      }
+                      return (
+                        <div key={p.id} className="px-3 py-2 rounded-lg bg-white/50 dark:bg-slate-900/30 border border-slate-100 dark:border-slate-800">
+                          <div className="grid grid-cols-12 gap-2 items-center text-[12px]">
+                            <span className="col-span-12 sm:col-span-3 font-bold text-foreground">
+                              {format(new Date(p.date), 'MMM dd, yyyy')}
+                            </span>
+                            <span className="col-span-6 sm:col-span-2 text-right font-black text-foreground">{peso(p.amount)}</span>
+                            {hasPenaltyCol && (
+                              <span className="col-span-6 sm:col-span-2 text-right font-semibold text-red-600">{peso(p.toPenalty)}</span>
+                            )}
+                            <span className={cn("col-span-6 text-right font-semibold text-orange-500", hasPenaltyCol ? "sm:col-span-1" : "sm:col-span-2")}>{peso(p.toInterest)}</span>
+                            <span className="col-span-6 sm:col-span-2 text-right font-semibold text-blue-600">{peso(p.toPrincipal)}</span>
+                            <span className="col-span-6 sm:col-span-2 text-right font-bold text-foreground">{peso(p.balanceAfter)}</span>
+                          </div>
+                          {note && (
+                            <p className={cn(
+                              "text-[10.5px] mt-1.5 leading-snug",
+                              p.fullyConsumedByInterest ? "text-red-600/90" : "text-muted-foreground"
+                            )}>
+                              {p.fullyConsumedByInterest && <span className="font-black uppercase tracking-wider mr-1">Why?</span>}
+                              {note}
+                            </p>
+                          )}
+                        </div>
+                      )
+                    })}
+                  </div>
+
+                  {/* Totals */}
+                  <div className="grid grid-cols-12 gap-2 items-center px-3 pt-2 mt-1 border-t border-dashed border-slate-300 dark:border-slate-700 text-[12px]">
+                    <span className="col-span-12 sm:col-span-3 text-[10px] font-black uppercase tracking-wider text-slate-500">Totals</span>
+                    <span className="col-span-6 sm:col-span-2 text-right font-black text-foreground">{peso(summary.paymentBreakdown.totalPaid)}</span>
+                    {summary.paymentBreakdown.totalToPenalty > 0 && (
+                      <span className="col-span-6 sm:col-span-2 text-right font-black text-red-600">{peso(summary.paymentBreakdown.totalToPenalty)}</span>
+                    )}
+                    <span className={cn("col-span-6 text-right font-black text-orange-500", summary.paymentBreakdown.totalToPenalty > 0 ? "sm:col-span-1" : "sm:col-span-2")}>{peso(summary.paymentBreakdown.totalToInterest)}</span>
+                    <span className="col-span-6 sm:col-span-2 text-right font-black text-blue-600">{peso(summary.paymentBreakdown.totalToPrincipal)}</span>
+                    <span className="col-span-6 sm:col-span-2 text-right" />
+                  </div>
+                  <p className="text-[11px] text-muted-foreground mt-1 leading-relaxed">
+                    So far {peso(summary.paymentBreakdown.totalPaid)} paid: <span className="font-semibold text-orange-500">{peso(summary.paymentBreakdown.totalToInterest)}</span> went to interest
+                    and <span className="font-semibold text-blue-600">{peso(summary.paymentBreakdown.totalToPrincipal)}</span> reduced the principal.
+                  </p>
+                </div>
+              )}
+
+              {/* Beginner glossary */}
+              <details className="mt-5 group">
+                <summary className="cursor-pointer text-[11px] font-bold uppercase tracking-wider text-slate-500 hover:text-foreground select-none">
+                  New to this? Tap to understand the terms
+                </summary>
+                <div className="mt-3 grid sm:grid-cols-2 gap-x-6 gap-y-2 text-[11px] text-muted-foreground leading-relaxed">
+                  <p><span className="font-bold text-foreground">Principal</span> — the amount originally borrowed ({peso(loan.loan_amount)}).</p>
+                  <p><span className="font-bold text-foreground">Outstanding balance</span> — how much principal is still unpaid ({peso(statement?.outstandingBalance ?? loan.balance)}).</p>
+                  <p><span className="font-bold text-foreground">Interest</span> — the fee for borrowing, charged each month on the balance.</p>
+                  <p><span className="font-bold text-foreground">Accrued interest</span> — interest already charged but not yet paid ({peso(statement?.accruedInterest ?? 0)}).</p>
+                  <p><span className="font-bold text-foreground">Reducing balance</span> — interest is calculated on what you still owe, so it falls as you pay down principal.</p>
+                  <p><span className="font-bold text-foreground">Payment order</span> — each payment covers penalties first, then interest, then principal.</p>
+                  <p><span className="font-bold text-foreground">Due to stay current</span> — the minimum (interest + penalties) to avoid falling behind.</p>
+                  <p><span className="font-bold text-foreground">Pay off today</span> — everything owed right now: balance + interest + penalties ({peso(statement?.payoffToday ?? 0)}).</p>
+                </div>
+              </details>
             </div>
           </Card>
         </div>
