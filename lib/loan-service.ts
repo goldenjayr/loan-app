@@ -255,19 +255,28 @@ export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
   const totalInterestCharged = money(accruals.reduce((s, a) => s + a.accrued_interest, 0))
   let interestPaid = money(totalInterestCharged - interestBalance)
 
-  const periods = accruals.map((a) => {
+  const periods = accruals.map((a, i) => {
     const charged = money(a.accrued_interest)
     const paid = money(Math.min(interestPaid, charged))
     interestPaid = money(interestPaid - paid)
     const remaining = money(charged - paid)
-    const past = new Date(a.accrual_date).getTime() < asOfDate.getTime()
+    const chargedDate = new Date(a.accrual_date)
+    const past = chargedDate.getTime() < asOfDate.getTime()
+    const status = remaining > 0.005 ? (past ? 'overdue' : 'due') : 'paid'
+    // This charge covers the span from the previous boundary (or disbursement) to
+    // this boundary; it "appears" (is billed) on the boundary date.
+    const periodStart = i > 0 ? accruals[i - 1].accrual_date : dateOnly(disburse)
     return {
       date: a.accrual_date,
+      periodStart,
+      chargedOn: a.accrual_date,
       openingBalance: money(a.principal_balance),
       interestCharged: charged,
       interestPaid: paid,
       interestRemaining: remaining,
-      status: remaining > 0.005 ? (past ? 'overdue' : 'due') : 'paid',
+      status,
+      // Days a still-unpaid past charge has been overdue (since the day it was billed).
+      daysOverdue: status === 'overdue' ? Math.max(0, daysBetween(chargedDate, asOfDate)) : 0,
     }
   })
 
@@ -282,6 +291,14 @@ export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
     }
   }
   const nextInterestCharge = nextDueDate && balance > 0.005 ? money(balance * rate) : 0
+
+  // Merge interest charges and payments into one chronological timeline so the
+  // statement reads as a story: interest billed → payment made → interest billed …
+  const pb = getPaymentBreakdown(loanId)
+  const timeline = [
+    ...periods.map((p) => ({ kind: 'interest' as const, sort: new Date(p.date).getTime(), tie: 0, ...p })),
+    ...pb.items.map((p) => ({ kind: 'payment' as const, sort: new Date(p.date).getTime(), tie: 1, ...p })),
+  ].sort((a, b) => a.sort - b.sort || a.tie - b.tie)
 
   const amountDueToStayCurrent = money(interestBalance + penaltyBalance)
   const payoffToday = money(balance + interestBalance + penaltyBalance)
@@ -308,6 +325,7 @@ export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
     termMonths: loan.loan_term_months,
     maturityDate: loan.maturity_date,
     periods,
+    timeline,
   }
 }
 

@@ -10,7 +10,7 @@ import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import LoanSummary from '@/components/loan-summary'
 import PaymentsList from '@/components/payments-list'
-import { ArrowLeft, Calendar, DollarSign, Clock, Trash2, Pencil } from 'lucide-react'
+import { ArrowLeft, Calendar, DollarSign, Clock, Trash2, Pencil, Download, Loader2 } from 'lucide-react'
 import Link from 'next/link'
 import { format } from 'date-fns'
 import { cn } from '@/lib/utils'
@@ -27,6 +27,7 @@ import {
 } from "@/components/ui/alert-dialog"
 import { toast } from 'sonner'
 import { useRouter } from 'next/navigation'
+import { downloadLoanReport } from '@/lib/download-report'
 
 export default function LoanDetailPage() {
   const router = useRouter()
@@ -38,6 +39,7 @@ export default function LoanDetailPage() {
   const [summary, setSummary] = useState<any>(null)
   const [loading, setLoading] = useState(true)
   const [deleting, setDeleting] = useState(false)
+  const [exporting, setExporting] = useState(false)
 
   useEffect(() => {
     const checkAuth = async () => {
@@ -102,6 +104,18 @@ export default function LoanDetailPage() {
     }
   }
 
+  const handleExport = async () => {
+    setExporting(true)
+    try {
+      await downloadLoanReport(loanId)
+      toast.success('PDF report downloaded')
+    } catch (error) {
+      toast.error(error instanceof Error ? error.message : 'Failed to export PDF')
+    } finally {
+      setExporting(false)
+    }
+  }
+
   const peso = (n: number) =>
     `₱${Number(n || 0).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
   const statement = summary?.statement
@@ -161,14 +175,28 @@ export default function LoanDetailPage() {
             <p className="text-muted-foreground mt-1">{loan.borrower?.email}</p>
           </div>
           <div className="flex gap-2 items-center">
+            <Button
+              variant="outline"
+              onClick={handleExport}
+              disabled={exporting}
+              aria-busy={exporting}
+              className="shadow-none"
+            >
+              {exporting ? (
+                <Loader2 className="size-4 animate-spin" aria-hidden="true" />
+              ) : (
+                <Download className="size-4" aria-hidden="true" />
+              )}
+              {exporting ? 'Exporting...' : 'Export PDF'}
+            </Button>
             <Link href={`/loans/${loanId}/edit`}>
-              <Button variant="outline" size="icon" className="shadow-none">
+              <Button variant="outline" size="icon" className="shadow-none" aria-label="Edit loan">
                 <Pencil className="w-4 h-4" />
               </Button>
             </Link>
             <AlertDialog>
               <AlertDialogTrigger asChild>
-                <Button variant="outline" size="icon" className="text-destructive border-destructive hover:bg-destructive shadow-none bg-transparent hover:text-white group">
+                <Button variant="outline" size="icon" aria-label="Delete loan" className="text-destructive border-destructive hover:bg-destructive shadow-none bg-transparent hover:text-white group">
                   <Trash2 className="w-4 h-4" />
                 </Button>
               </AlertDialogTrigger>
@@ -315,13 +343,57 @@ export default function LoanDetailPage() {
                    <span className="text-emerald-700 dark:text-emerald-400 font-semibold"> Paid</span> = interest settled,
                    <span className="text-red-600 font-semibold"> Overdue</span> = a past month still unpaid,
                    <span className="text-blue-600 font-semibold"> Due</span> = upcoming.
+                   <span className="text-indigo-600 font-semibold"> Indigo dots</span> are the customer's payments.
                  </p>
 
-                 {(!statement?.periods || statement.periods.length === 0) ? (
-                   <p className="text-sm text-muted-foreground italic py-2">No interest charged yet.</p>
+                 {(!statement?.timeline || statement.timeline.length === 0) ? (
+                   <p className="text-sm text-muted-foreground italic py-2">No interest charged or payments yet.</p>
                  ) : (
                  <div className="relative space-y-5 before:absolute before:left-[11px] before:top-2 before:bottom-2 before:w-px before:bg-slate-200 dark:before:bg-slate-800">
-                   {statement.periods.map((item: any, idx: number) => {
+                   {statement.timeline.map((item: any, idx: number) => {
+                     // Payment event in the timeline
+                     if (item.kind === 'payment') {
+                       return (
+                         <div key={idx} className="relative pl-8 flex justify-between items-center group transition-all duration-300 hover:translate-x-1">
+                           <div className="absolute left-0 top-[2px] w-[22px] h-[22px] rounded-full border-4 border-white dark:border-slate-950 flex items-center justify-center shadow-lg transform transition-transform group-hover:scale-125 z-10 bg-indigo-500">
+                             <div className="w-1.5 h-1.5 rounded-full bg-white" />
+                           </div>
+                           <div className="flex flex-col">
+                             <span className="text-[14px] font-black text-foreground tracking-tight leading-none">
+                               {format(new Date(item.date), 'MMMM dd, yyyy')}
+                             </span>
+                             <div className="flex items-center gap-2 mt-2 flex-wrap">
+                               <span className="text-[9px] font-black uppercase px-2 py-0.5 rounded shadow-sm tracking-widest text-white bg-indigo-600">Payment</span>
+                               {item.toPenalty > 0 && (
+                                 <span className="text-[9px] text-red-600 font-bold tracking-tight uppercase">→ Penalty {peso(item.toPenalty)}</span>
+                               )}
+                               <span className="text-[9px] text-orange-500 font-bold tracking-tight uppercase">→ Interest {peso(item.toInterest)}</span>
+                               <span className="text-[9px] text-blue-600 font-bold tracking-tight uppercase">→ Principal {peso(item.toPrincipal)}</span>
+                             </div>
+                             {item.fullyConsumedByInterest && (
+                               <p className="text-[10px] text-red-600/90 mt-1.5 leading-snug">
+                                 <span className="font-black uppercase tracking-wider mr-1">Why?</span>
+                                 Interest had piled up to {peso(item.interestDueBefore)}, so this payment went entirely to interest — ₱0.00 reduced the balance.
+                               </p>
+                             )}
+                           </div>
+                           <div className="text-right">
+                             <div className="flex items-center gap-6 justify-end">
+                               <div className="flex flex-col items-end">
+                                 <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Paid</p>
+                                 <span className="text-[13px] font-black text-emerald-600">{peso(item.amount)}</span>
+                               </div>
+                               <div className="h-10 w-px bg-slate-200 dark:bg-slate-800" />
+                               <div className="flex flex-col items-end">
+                                 <p className="text-[9px] text-slate-400 font-black uppercase tracking-tighter">Balance After</p>
+                                 <div className="text-[16px] font-black text-foreground tracking-tighter">{peso(item.balanceAfter)}</div>
+                               </div>
+                             </div>
+                           </div>
+                         </div>
+                       )
+                     }
+                     // Interest charge event
                      const isOverdue = item.status === 'overdue'
                      const isPaid = item.status === 'paid'
                      return (
@@ -358,6 +430,17 @@ export default function LoanDetailPage() {
                              </>
                            )}
                          </div>
+                         {/* When this interest appears, and how long overdue */}
+                         <p className="text-[10px] text-muted-foreground mt-1.5 leading-snug">
+                           Appears on <span className="font-semibold text-foreground">{format(new Date(item.chargedOn ?? item.date), 'MMM dd, yyyy')}</span>
+                           {item.periodStart && (
+                             <> — interest for {format(new Date(item.periodStart), 'MMM dd')}–{format(new Date(item.date), 'MMM dd')}</>
+                           )}
+                           {isOverdue && (
+                             <span className="text-red-600 font-semibold"> · overdue since {format(new Date(item.date), 'MMM dd')} ({item.daysOverdue} day{item.daysOverdue === 1 ? '' : 's'})</span>
+                           )}
+                           {isPaid && <span className="text-emerald-700 font-semibold"> · settled</span>}
+                         </p>
                        </div>
 
                        <div className="text-right">
