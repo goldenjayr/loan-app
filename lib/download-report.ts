@@ -5,42 +5,31 @@ interface DownloadAnchor {
 }
 
 interface DownloadDependencies {
-  fetcher: typeof fetch
   createAnchor: () => DownloadAnchor
-  createObjectURL: (blob: Blob) => string
-  revokeObjectURL: (url: string) => void
+  appendAnchor: (anchor: DownloadAnchor) => void
+  removeAnchor: (anchor: DownloadAnchor) => void
 }
 
 function browserDependencies(): DownloadDependencies {
   return {
-    fetcher: fetch,
     createAnchor: () => document.createElement('a'),
-    createObjectURL: (blob) => URL.createObjectURL(blob),
-    revokeObjectURL: (url) => URL.revokeObjectURL(url),
+    appendAnchor: (anchor) => document.body.appendChild(anchor as HTMLAnchorElement),
+    removeAnchor: (anchor) => (anchor as HTMLAnchorElement).remove(),
   }
 }
 
-export async function downloadLoanReport(
+export function downloadLoanReport(
   loanId: string,
   dependencies: DownloadDependencies = browserDependencies()
-): Promise<void> {
-  const response = await dependencies.fetcher(`/api/loans/${loanId}/report`)
-
-  if (!response.ok) {
-    const body = await response.json().catch(() => null) as { error?: string } | null
-    throw new Error(body?.error || 'Failed to export PDF')
-  }
-
-  const disposition = response.headers.get('content-disposition') || ''
-  const filename = disposition.match(/filename="([^"]+)"/)?.[1] || `loan-${loanId}-report.pdf`
-  const objectUrl = dependencies.createObjectURL(await response.blob())
+): void {
+  const anchor = dependencies.createAnchor()
+  anchor.href = `/api/loans/${loanId}/report`
+  anchor.download = `loan-${loanId}-report.pdf`
+  dependencies.appendAnchor(anchor)
 
   try {
-    const anchor = dependencies.createAnchor()
-    anchor.href = objectUrl
-    anchor.download = filename
     anchor.click()
   } finally {
-    dependencies.revokeObjectURL(objectUrl)
+    dependencies.removeAnchor(anchor)
   }
 }
