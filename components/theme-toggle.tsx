@@ -51,26 +51,38 @@ export function ThemeToggle({ className, showLabel = false }: Props) {
       Math.max(y, window.innerHeight - y)
     )
 
+    const root = document.documentElement
+    root.classList.add('theme-transitioning')
+
     const transition = (
       document as Document & {
-        startViewTransition: (cb: () => void) => { ready: Promise<void> }
+        startViewTransition: (cb: () => void) => {
+          ready: Promise<void>
+          finished: Promise<void>
+        }
       }
     ).startViewTransition(apply)
 
-    transition.ready.then(() => {
-      document.documentElement.animate(
-        {
-          clipPath: [
-            `circle(0px at ${x}px ${y}px)`,
-            `circle(${endRadius}px at ${x}px ${y}px)`,
-          ],
-        },
-        {
-          duration: 480,
-          easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
-          pseudoElement: '::view-transition-new(root)',
-        }
-      )
+    transition.ready
+      .then(() => {
+        document.documentElement.animate(
+          {
+            clipPath: [
+              `circle(0px at ${x}px ${y}px)`,
+              `circle(${endRadius}px at ${x}px ${y}px)`,
+            ],
+          },
+          {
+            duration: 480,
+            easing: 'cubic-bezier(0.22, 1, 0.36, 1)',
+            pseudoElement: '::view-transition-new(root)',
+          }
+        )
+      })
+      .catch(() => {})
+
+    transition.finished.finally(() => {
+      root.classList.remove('theme-transitioning')
     })
   }
 

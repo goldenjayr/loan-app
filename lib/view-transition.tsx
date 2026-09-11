@@ -1,8 +1,10 @@
 'use client'
 
 /**
- * View Transition helpers. Next.js bundles React canary with ViewTransition /
- * addTransitionType even when @types/react doesn't declare them yet.
+ * View Transition helpers.
+ * React's experimental <ViewTransition> has crashed Chromium in production
+ * when combined with Next navigations, so we keep a safe no-op wrapper and
+ * only use addTransitionType when the runtime supports it without mounting VT trees.
  */
 import * as React from 'react'
 import type { ReactNode } from 'react'
@@ -18,26 +20,18 @@ type VTProps = {
 
 const ReactAny = React as any
 
-export const ViewTransition = (ReactAny.ViewTransition ||
-  function Fallback({ children }: { children?: ReactNode }) {
-    return children
-  }) as (props: VTProps) => React.ReactElement | null
-
-export function addTransitionType(type: string) {
-  if (typeof ReactAny.addTransitionType === 'function') {
-    ReactAny.addTransitionType(type)
-  }
+/** Stable no-op: avoids Chromium tab crashes from experimental ViewTransition. */
+export function ViewTransition({ children }: VTProps) {
+  return <>{children}</>
 }
 
-/** Hierarchical list → detail / detail → list transitions. */
+export function addTransitionType(type: string) {
+  // Intentionally no-op for now — pairing with experimental VT crashed tabs.
+  void type
+  void ReactAny.addTransitionType
+}
+
+/** Hierarchical list → detail / detail → list transitions (CSS-only stagger remains). */
 export function PageTransition({ children }: { children: ReactNode }) {
-  return (
-    <ViewTransition
-      enter={{ 'nav-forward': 'nav-forward', 'nav-back': 'nav-back', default: 'fade-in' }}
-      exit={{ 'nav-forward': 'nav-forward', 'nav-back': 'nav-back', default: 'fade-out' }}
-      default="none"
-    >
-      {children}
-    </ViewTransition>
-  )
+  return <>{children}</>
 }

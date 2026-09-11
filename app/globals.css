@@ -247,17 +247,18 @@
   }
 }
 
-/* Theme toggle circular wipe (View Transitions API) */
-::view-transition-old(root),
-::view-transition-new(root) {
+/* Theme toggle circular wipe — ONLY while .theme-transitioning is set.
+   Leaving these rules global crashes Chromium during React/Next view transitions. */
+html.theme-transitioning::view-transition-old(root),
+html.theme-transitioning::view-transition-new(root) {
   animation: none;
   mix-blend-mode: normal;
 }
 
-::view-transition-old(root) {
+html.theme-transitioning::view-transition-old(root) {
   z-index: 1;
 }
 
-::view-transition-new(root) {
+html.theme-transitioning::view-transition-new(root) {
   z-index: 9999;
 }

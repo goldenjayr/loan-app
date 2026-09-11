@@ -11,11 +11,9 @@ import {
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
 import { createClient } from '@/lib/supabase/client'
-import { useRouter } from 'next/navigation'
 import { FormEvent, useState } from 'react'
 
 export default function Page() {
-  const router = useRouter()
   const [email, setEmail] = useState('admin@example.com')
   const [password, setPassword] = useState('')
   const [error, setError] = useState<string | null>(null)
@@ -35,8 +33,9 @@ export default function Page() {
         setError(signInError.message)
         return
       }
-      router.replace('/')
-      router.refresh()
+      // Hard navigation avoids a Chromium crash seen with client transition right after auth.
+      window.location.assign('/')
+      return
     } catch (err: any) {
       setError(err?.message || 'Login failed')
     } finally {
