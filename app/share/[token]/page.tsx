@@ -1,15 +1,12 @@
+import { Suspense } from 'react'
 import { loadSharedLoanDetail } from '@/lib/data'
 import ShareLoanClient from './share-loan-client'
 import { Card } from '@/components/ui/card'
+import { ShareLoadingScreen } from './share-loading-screen'
 
 export const dynamic = 'force-dynamic'
 
-export default async function ShareLoanPage({
-  params,
-}: {
-  params: Promise<{ token: string }>
-}) {
-  const { token } = await params
+async function ShareLoanContent({ token }: { token: string }) {
   const detail = await loadSharedLoanDetail(token)
 
   if (!detail) {
@@ -26,4 +23,18 @@ export default async function ShareLoanPage({
   }
 
   return <ShareLoanClient token={token} loan={detail.loan} summary={detail.summary} />
+}
+
+export default async function ShareLoanPage({
+  params,
+}: {
+  params: Promise<{ token: string }>
+}) {
+  const { token } = await params
+
+  return (
+    <Suspense fallback={<ShareLoadingScreen />}>
+      <ShareLoanContent token={token} />
+    </Suspense>
+  )
 }
