@@ -5,15 +5,24 @@ import DashboardHeader from '@/components/dashboard-header'
 import DashboardMetrics from '@/components/dashboard-metrics'
 import BorrowersList from '@/components/borrowers-list'
 import LoansList from '@/components/loans-list'
+import { createClient } from '@/lib/supabase/client'
 
 export default function DashboardPage() {
   const [loans, setLoans] = useState<any[]>([])
   const [borrowers, setBorrowers] = useState<any[]>([])
+  const [user, setUser] = useState<{ email?: string | null } | null>(null)
   const [loading, setLoading] = useState(true)
 
   useEffect(() => {
     const loadData = async () => {
-      // Fetch loans
+      try {
+        const supabase = createClient()
+        const { data } = await supabase.auth.getUser()
+        setUser(data.user)
+      } catch (error) {
+        console.error('Failed to fetch user:', error)
+      }
+
       try {
         const loansResponse = await fetch('/api/loans')
         if (loansResponse.ok) {
@@ -23,7 +32,6 @@ export default function DashboardPage() {
         console.error('Failed to fetch loans:', error)
       }
 
-      // Fetch borrowers
       try {
         const borrowersResponse = await fetch('/api/borrowers')
         if (borrowersResponse.ok) {
@@ -49,7 +57,7 @@ export default function DashboardPage() {
 
   return (
     <main className="min-h-screen bg-background">
-      <DashboardHeader user={{ email: 'admin@example.com' }} />
+      <DashboardHeader user={user} />
 
       <div className="container mx-auto px-4 py-8 space-y-8">
         <DashboardMetrics loans={loans} borrowers={borrowers} />

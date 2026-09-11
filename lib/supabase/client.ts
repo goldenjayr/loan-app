@@ -1,20 +1,8 @@
-// Dummy supabase client for compatibility
-export function createClient() {
-  return {
-    auth: {
-      getUser: async () => ({ data: { user: { email: 'admin@example.com' } }, error: null }),
-      signOut: async () => {},
-      signInWithPassword: async () => ({ error: null }),
-      signUp: async () => ({ error: null }),
-    },
-    from: () => ({
-      select: () => ({ eq: () => ({ single: () => ({}) }) }),
-      insert: () => ({ select: () => ({}) }),
-    }),
-  }
-}
+import { createBrowserClient } from '@supabase/ssr'
 
-// Dummy createBrowserClient
-export function createBrowserClient() {
-  return createClient()
+export function createClient() {
+  return createBrowserClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
 }

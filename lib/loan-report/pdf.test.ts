@@ -5,7 +5,7 @@ import { renderLoanReportPdf } from './pdf'
 
 describe('loan PDF renderer', () => {
   it('creates a readable multi-page A4 PDF from current account data', async () => {
-    const report = buildLoanReportData(3, new Date('2026-07-15T00:00:00+08:00'))
+    const report = await buildLoanReportData(3, new Date('2026-07-15T00:00:00+08:00'))
     const bytes = await renderLoanReportPdf(report)
 
     expect(Buffer.from(bytes).subarray(0, 5).toString()).toBe('%PDF-')

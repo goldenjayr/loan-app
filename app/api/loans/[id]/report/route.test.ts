@@ -14,6 +14,10 @@ vi.mock('@/lib/loan-report/data', () => ({
 
 vi.mock('@/lib/loan-report/pdf', () => ({ renderLoanReportPdf }))
 
+vi.mock('@/lib/auth', () => ({
+  requireUser: vi.fn(async () => ({ user: { id: 'admin' }, errorResponse: null })),
+}))
+
 import { LoanReportNotFoundError } from '@/lib/loan-report/data'
 import { GET } from './route'
 
@@ -22,7 +26,7 @@ const request = new NextRequest('http://localhost/api/loans/3/report')
 describe('loan report route', () => {
   beforeEach(() => {
     vi.clearAllMocks()
-    buildLoanReportData.mockReturnValue({
+    buildLoanReportData.mockResolvedValue({
       borrower: { firstName: 'Julie Ann', lastName: 'Campugan' },
     })
     renderLoanReportPdf.mockResolvedValue(new Uint8Array([37, 80, 68, 70, 45]))

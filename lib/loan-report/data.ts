@@ -1,4 +1,4 @@
-import getDb from '@/lib/db'
+import { sql, num, dateStr } from '@/lib/db'
 import { getLoanSummary } from '@/lib/loan-service'
 import type { LoanReportData } from './types'
 
@@ -19,12 +19,11 @@ export function slugifyBorrowerName(name: string): string {
     .replace(/^-|-$/g, '')
 }
 
-export function buildLoanReportData(
+export async function buildLoanReportData(
   loanId: number,
   generatedAt: Date = new Date()
-): LoanReportData {
-  const db = getDb()
-  const loan = db.prepare(`
+): Promise<LoanReportData> {
+  const [loan] = await sql`
     SELECT
       l.*,
       b.first_name AS borrower_first_name,
@@ -32,8 +31,8 @@ export function buildLoanReportData(
       b.email AS borrower_email
     FROM loans l
     LEFT JOIN borrowers b ON b.id = l.borrower_id
-    WHERE l.id = ?
-  `).get(loanId) as any
+    WHERE l.id = ${loanId}
+  `
 
   if (!loan) throw new LoanReportNotFoundError(loanId)
 
@@ -46,17 +45,17 @@ export function buildLoanReportData(
     },
     status: loan.status,
     terms: {
-      originalPrincipal: Number(loan.principal_amount || loan.loan_amount || 0),
-      outstandingPrincipal: Number(loan.balance || 0),
-      interestRate: Number(loan.interest_rate || 0),
+      originalPrincipal: num(loan.principal_amount || loan.loan_amount),
+      outstandingPrincipal: num(loan.balance),
+      interestRate: num(loan.interest_rate),
       interestType: loan.interest_type || 'simple',
       termMonths: Number(loan.loan_term_months || 0),
       paymentFrequency: loan.payment_frequency || 'monthly',
-      disbursementDate: loan.disbursement_date,
-      maturityDate: loan.maturity_date,
-      penaltyPerDay: Number(loan.penalty_per_day || 0),
+      disbursementDate: dateStr(loan.disbursement_date),
+      maturityDate: dateStr(loan.maturity_date),
+      penaltyPerDay: num(loan.penalty_per_day),
     },
-    summary: getLoanSummary(loanId),
+    summary: await getLoanSummary(loanId),
     generatedAt,
   }
 }

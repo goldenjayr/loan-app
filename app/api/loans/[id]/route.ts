@@ -1,11 +1,16 @@
-import getDb from '@/lib/db'
+import { requireUser } from '@/lib/auth'
+import { sql, num } from '@/lib/db'
+import { auditLoanChange, rebuildLoan } from '@/lib/loan-service'
 import { money } from '@/lib/money'
 import { NextRequest, NextResponse } from 'next/server'
 
 export async function GET(
-  request: NextRequest,
+  _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const { errorResponse } = await requireUser()
+  if (errorResponse) return errorResponse
+
   try {
     const { id } = await params
     const loanId = parseInt(id)
@@ -13,21 +18,38 @@ export async function GET(
       return NextResponse.json({ error: 'Invalid loan ID' }, { status: 400 })
     }
 
-    const db = getDb()
-    const loan = db.prepare(`
+    const [loan] = await sql`
       SELECT l.*, b.first_name as borrower_first_name, b.last_name as borrower_last_name, b.email as borrower_email
       FROM loans l LEFT JOIN borrowers b ON l.borrower_id = b.id
-      WHERE l.id = ?
-    `).get(loanId) as any
+      WHERE l.id = ${loanId}
+    `
 
     if (!loan) {
       return NextResponse.json({ error: 'Loan not found' }, { status: 404 })
     }
 
+    const [activity] = await sql`
+      SELECT
+        (SELECT COUNT(*)::int FROM payments WHERE loan_id = ${loanId})
+        + (SELECT COUNT(*)::int FROM interest_accruals WHERE loan_id = ${loanId}) AS n
+    `
+
     const data = {
       ...loan,
+      principal_amount: num(loan.principal_amount),
+      loan_amount: num(loan.loan_amount),
+      balance: num(loan.balance),
+      interest_rate: num(loan.interest_rate),
+      interest_balance: num(loan.interest_balance),
+      penalty_balance: num(loan.penalty_balance),
+      penalty_per_day: num(loan.penalty_per_day),
+      has_activity: Number(activity.n) > 0,
       borrower: loan.borrower_first_name
-        ? { first_name: loan.borrower_first_name, last_name: loan.borrower_last_name, email: loan.borrower_email }
+        ? {
+            first_name: loan.borrower_first_name,
+            last_name: loan.borrower_last_name,
+            email: loan.borrower_email,
+          }
         : null,
     }
     return NextResponse.json(data)
@@ -41,6 +63,9 @@ export async function PUT(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const auth = await requireUser()
+  if (auth.errorResponse) return auth.errorResponse
+
   try {
     const { id } = await params
     const loanId = parseInt(id)
@@ -48,35 +73,30 @@ export async function PUT(
       return NextResponse.json({ error: 'Invalid loan ID' }, { status: 400 })
     }
 
-    const db = getDb()
-    const loan = db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId) as any
+    const [loan] = await sql`SELECT * FROM loans WHERE id = ${loanId}`
     if (!loan) {
       return NextResponse.json({ error: 'Loan not found' }, { status: 404 })
     }
 
     const body = await request.json()
 
-    // A loan that has already had payments or interest accrued cannot have its core
-    // financial terms changed (that would corrupt history). Only such loans may edit
-    // amount / disbursement date / term / interest type.
-    const paymentCount = (db.prepare('SELECT COUNT(*) AS c FROM payments WHERE loan_id = ?').get(loanId) as any).c
-    const accrualCount = (db.prepare('SELECT COUNT(*) AS c FROM interest_accruals WHERE loan_id = ?').get(loanId) as any).c
-    const hasActivity = paymentCount > 0 || accrualCount > 0
+    const [paymentCountRow] = await sql`SELECT COUNT(*)::int AS c FROM payments WHERE loan_id = ${loanId}`
+    const [accrualCountRow] = await sql`SELECT COUNT(*)::int AS c FROM interest_accruals WHERE loan_id = ${loanId}`
+    const hasActivity = paymentCountRow.c > 0 || accrualCountRow.c > 0
 
     const updates: Record<string, any> = {}
 
-    // Always-editable fields.
     if (body.notes !== undefined) updates.notes = body.notes || null
     if (body.payment_frequency !== undefined) updates.payment_frequency = body.payment_frequency
     if (body.interest_rate !== undefined) {
-      const rate = parseFloat(body.interest_rate)
+      const rate = Number(body.interest_rate)
       if (!Number.isFinite(rate) || rate < 0) {
         return NextResponse.json({ error: 'Interest rate must be zero or a positive number' }, { status: 400 })
       }
       updates.interest_rate = rate
     }
     if (body.penalty_per_day !== undefined) {
-      const penalty = parseFloat(body.penalty_per_day)
+      const penalty = Number(body.penalty_per_day)
       if (!Number.isFinite(penalty) || penalty < 0) {
         return NextResponse.json({ error: 'Penalty per day must be zero or a positive number' }, { status: 400 })
       }
@@ -89,38 +109,49 @@ export async function PUT(
       }
       updates.status = body.status
     }
+    if (body.grace_period_days !== undefined) {
+      const grace = Number(body.grace_period_days)
+      if (!Number.isInteger(grace) || grace < 0) {
+        return NextResponse.json({ error: 'Grace period must be zero or a positive whole number of days' }, { status: 400 })
+      }
+      updates.grace_period_days = grace
+    }
+    if (body.interest_type !== undefined) {
+      if (!['simple', 'compound'].includes(body.interest_type)) {
+        return NextResponse.json({ error: "Interest type must be 'simple' or 'compound'" }, { status: 400 })
+      }
+      updates.interest_type = body.interest_type
+    }
 
-    // Core financial fields — only when the loan has no activity yet.
     const wantsCoreEdit =
       body.loan_amount !== undefined ||
       body.disbursement_date !== undefined ||
-      body.loan_term_months !== undefined ||
-      body.interest_type !== undefined
+      body.loan_term_months !== undefined
 
     if (wantsCoreEdit) {
       if (hasActivity) {
         return NextResponse.json(
-          { error: 'Cannot change loan amount, term, disbursement date or interest type after payments or interest exist. Edit these only before activity, or create a new loan.' },
+          {
+            error:
+              'Cannot change loan amount, term or disbursement date after payments or interest exist. Edit these only before activity, or create a new loan.',
+          },
           { status: 400 }
         )
       }
 
-      let amount = loan.loan_amount
+      let amount = num(loan.loan_amount)
       if (body.loan_amount !== undefined) {
-        amount = money(parseFloat(body.loan_amount))
+        amount = money(Number(body.loan_amount))
         if (!Number.isFinite(amount) || amount <= 0) {
           return NextResponse.json({ error: 'Loan amount must be a positive number' }, { status: 400 })
         }
-        // No activity yet, so principal/balance track the new amount.
         updates.loan_amount = amount
         updates.principal_amount = amount
         updates.balance = amount
       }
-      if (body.interest_type !== undefined) updates.interest_type = body.interest_type
-
-      let term = loan.loan_term_months
+      let term = Number(loan.loan_term_months)
       if (body.loan_term_months !== undefined) {
-        term = parseInt(body.loan_term_months)
+        term = Number(body.loan_term_months)
         if (!Number.isInteger(term) || term <= 0) {
           return NextResponse.json({ error: 'Loan term must be a positive whole number of months' }, { status: 400 })
         }
@@ -136,7 +167,6 @@ export async function PUT(
         updates.disbursement_date = disbursement
       }
 
-      // Recompute maturity if disbursement or term changed.
       if (body.disbursement_date !== undefined || body.loan_term_months !== undefined) {
         const d = new Date(disbursement)
         const targetDay = d.getDate()
@@ -151,11 +181,26 @@ export async function PUT(
     }
 
     updates.updated_at = new Date().toISOString()
-    const cols = Object.keys(updates)
-    const setClause = cols.map((c) => `${c} = ?`).join(', ')
-    db.prepare(`UPDATE loans SET ${setClause} WHERE id = ?`).run(...cols.map((c) => updates[c]), loanId)
 
-    const updated = db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId)
+    const affectsReplay = [
+      'interest_type',
+      'interest_rate',
+      'penalty_per_day',
+      'grace_period_days',
+      'payment_frequency',
+      'loan_amount',
+      'disbursement_date',
+      'loan_term_months',
+    ].some((c) => c in updates)
+
+    const updated = await sql.begin(async (tx) => {
+      await auditLoanChange(loanId, loan, updates, tx as any, auth.user!.id)
+      await tx`UPDATE loans SET ${tx(updates)} WHERE id = ${loanId}`
+      if (affectsReplay) await rebuildLoan(loanId, new Date(), tx as any)
+      const [row] = await tx`SELECT * FROM loans WHERE id = ${loanId}`
+      return row
+    })
+
     return NextResponse.json(updated)
   } catch (error) {
     console.error('Error updating loan:', error)
@@ -164,9 +209,12 @@ export async function PUT(
 }
 
 export async function DELETE(
-  request: NextRequest,
+  _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const { errorResponse } = await requireUser()
+  if (errorResponse) return errorResponse
+
   try {
     const { id } = await params
     const loanId = parseInt(id)
@@ -174,23 +222,15 @@ export async function DELETE(
       return NextResponse.json({ error: 'Invalid loan ID' }, { status: 400 })
     }
 
-    const db = getDb()
-    
-    // Check if loan exists
-    const loan = db.prepare('SELECT id FROM loans WHERE id = ?').get(loanId)
+    const [loan] = await sql`SELECT id FROM loans WHERE id = ${loanId}`
     if (!loan) {
       return NextResponse.json({ error: 'Loan not found' }, { status: 404 })
     }
 
-    // Delete loan (cascading deletes for payments, accruals, penalties are handled by DB)
-    db.prepare('DELETE FROM loans WHERE id = ?').run(loanId)
-
+    await sql`DELETE FROM loans WHERE id = ${loanId}`
     return NextResponse.json({ message: 'Loan deleted successfully' })
-  } catch (error: any) {
+  } catch (error) {
     console.error('Error deleting loan:', error)
-    return NextResponse.json(
-      { error: 'Failed to delete loan' },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: 'Failed to delete loan' }, { status: 500 })
   }
 }

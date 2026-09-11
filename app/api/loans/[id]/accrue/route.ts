@@ -1,15 +1,18 @@
+import { requireUser } from '@/lib/auth'
 import { accrueLoan } from '@/lib/loan-service'
 import { NextRequest, NextResponse } from 'next/server'
 
 /**
  * Bring a loan's interest, penalties and status up to date. This is a deliberate
- * WRITE (POST) — reads (the summary GET) never mutate. Idempotent, so it is safe
- * for a scheduler/cron to call periodically or for the UI to call on view.
+ * WRITE (POST) — reads (the summary GET) never mutate. Idempotent.
  */
 export async function POST(
-  request: NextRequest,
+  _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const { errorResponse } = await requireUser()
+  if (errorResponse) return errorResponse
+
   try {
     const { id } = await params
     const loanId = parseInt(id)
@@ -17,7 +20,7 @@ export async function POST(
       return NextResponse.json({ error: 'Invalid loan ID' }, { status: 400 })
     }
 
-    const loan = accrueLoan(loanId)
+    const loan = await accrueLoan(loanId)
     return NextResponse.json(loan)
   } catch (error: any) {
     if (error.message === 'Loan not found') {

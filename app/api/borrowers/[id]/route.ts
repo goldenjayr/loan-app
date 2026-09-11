@@ -1,10 +1,14 @@
-import getDb from '@/lib/db'
+import { requireUser } from '@/lib/auth'
+import { sql } from '@/lib/db'
 import { NextRequest, NextResponse } from 'next/server'
 
 export async function DELETE(
-  request: NextRequest,
+  _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const { errorResponse } = await requireUser()
+  if (errorResponse) return errorResponse
+
   try {
     const { id } = await params
     const borrowerId = parseInt(id)
@@ -12,31 +16,25 @@ export async function DELETE(
       return NextResponse.json({ error: 'Invalid borrower ID' }, { status: 400 })
     }
 
-    const db = getDb()
-    
-    // Check if borrower exists
-    const borrower = db.prepare('SELECT id FROM borrowers WHERE id = ?').get(borrowerId)
+    const [borrower] = await sql`SELECT id FROM borrowers WHERE id = ${borrowerId}`
     if (!borrower) {
       return NextResponse.json({ error: 'Borrower not found' }, { status: 404 })
     }
 
-    // Check for active or past loans (DB RESTRICT will catch this, but pre-check for better message)
-    const loansCount = db.prepare('SELECT count(*) as count FROM loans WHERE borrower_id = ?').get(borrowerId) as any
+    const [loansCount] = await sql`SELECT count(*)::int AS count FROM loans WHERE borrower_id = ${borrowerId}`
     if (loansCount.count > 0) {
-      return NextResponse.json({ 
-        error: 'Cannot delete borrower with associated loans. Please delete all their loans first.' 
-      }, { status: 400 })
+      return NextResponse.json(
+        {
+          error: 'Cannot delete borrower with associated loans. Please delete all their loans first.',
+        },
+        { status: 400 }
+      )
     }
 
-    // Delete borrower
-    db.prepare('DELETE FROM borrowers WHERE id = ?').run(borrowerId)
-
+    await sql`DELETE FROM borrowers WHERE id = ${borrowerId}`
     return NextResponse.json({ message: 'Borrower deleted successfully' })
-  } catch (error: any) {
+  } catch (error) {
     console.error('Error deleting borrower:', error)
-    return NextResponse.json(
-      { error: 'Failed to delete borrower' },
-      { status: 500 }
-    )
+    return NextResponse.json({ error: 'Failed to delete borrower' }, { status: 500 })
   }
 }

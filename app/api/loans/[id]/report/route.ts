@@ -1,3 +1,4 @@
+import { requireUser } from '@/lib/auth'
 import { NextRequest, NextResponse } from 'next/server'
 import {
   buildLoanReportData,
@@ -12,6 +13,9 @@ export async function GET(
   _request: NextRequest,
   { params }: { params: Promise<{ id: string }> }
 ) {
+  const { errorResponse } = await requireUser()
+  if (errorResponse) return errorResponse
+
   const { id } = await params
   const loanId = Number(id)
 
@@ -20,11 +24,10 @@ export async function GET(
   }
 
   try {
-    const report = buildLoanReportData(loanId)
+    const report = await buildLoanReportData(loanId)
     const bytes = await renderLoanReportPdf(report)
-    const borrowerSlug = slugifyBorrowerName(
-      `${report.borrower.firstName} ${report.borrower.lastName}`
-    ) || 'borrower'
+    const borrowerSlug =
+      slugifyBorrowerName(`${report.borrower.firstName} ${report.borrower.lastName}`) || 'borrower'
 
     return new NextResponse(Buffer.from(bytes), {
       status: 200,

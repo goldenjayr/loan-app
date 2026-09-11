@@ -2,14 +2,31 @@
 
 import Link from 'next/link'
 import { Menu } from 'lucide-react'
+import { useRouter } from 'next/navigation'
 import { useState } from 'react'
+import { Button } from '@/components/ui/button'
+import { createClient } from '@/lib/supabase/client'
 
 interface DashboardHeaderProps {
-  user?: any
+  user?: { email?: string | null } | null
 }
 
 export default function DashboardHeader({ user }: DashboardHeaderProps) {
+  const router = useRouter()
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
+  const [signingOut, setSigningOut] = useState(false)
+
+  async function handleSignOut() {
+    setSigningOut(true)
+    try {
+      const supabase = createClient()
+      await supabase.auth.signOut()
+      router.replace('/auth/login')
+      router.refresh()
+    } finally {
+      setSigningOut(false)
+    }
+  }
 
   return (
     <header className="border-b border-border bg-card">
@@ -37,11 +54,18 @@ export default function DashboardHeader({ user }: DashboardHeaderProps) {
         </nav>
 
         <div className="flex items-center gap-4">
-          {user && (
-            <div className="text-sm text-muted-foreground hidden md:block">
-              {user.email}
-            </div>
+          {user?.email && (
+            <div className="text-sm text-muted-foreground hidden md:block">{user.email}</div>
           )}
+          <Button
+            variant="outline"
+            size="sm"
+            className="hidden md:inline-flex"
+            onClick={handleSignOut}
+            disabled={signingOut}
+          >
+            {signingOut ? 'Signing out…' : 'Sign out'}
+          </Button>
           <button onClick={() => setMobileMenuOpen(!mobileMenuOpen)} className="md:hidden p-2">
             <Menu className="w-5 h-5 text-foreground" />
           </button>
@@ -62,6 +86,13 @@ export default function DashboardHeader({ user }: DashboardHeaderProps) {
           <Link href="/reports" className="block text-sm font-medium text-foreground hover:text-primary">
             Reports
           </Link>
+          <button
+            className="block text-sm font-medium text-foreground hover:text-primary"
+            onClick={handleSignOut}
+            disabled={signingOut}
+          >
+            {signingOut ? 'Signing out…' : 'Sign out'}
+          </button>
         </div>
       )}
     </header>

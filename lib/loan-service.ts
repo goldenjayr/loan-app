@@ -1,53 +1,73 @@
-import type Database from 'better-sqlite3'
-import getDb from './db'
+import { sql, num, dateStr } from './db'
 import { money, isZero } from './money'
-import { calculateMonthlyPayment } from './calculations'
 
 /**
  * LOAN FINANCIAL ENGINE — deterministic replay
  * --------------------------------------------
- * Model: reducing-balance interest.
+ * Model: reducing-balance interest, simple or compounding per `loans.interest_type`.
  *   - At each payment-period boundary (from disbursement, stepped by
- *     payment_frequency), interest = current outstanding principal × periodRate.
- *   - Penalties accrue PER DAY on the overdue principal for as long as the loan
- *     is in arrears (a due date passed with unpaid interest). Arrears clears when
- *     a payment brings interest current.
+ *     payment_frequency), interest = base × periodRate, where base is the
+ *     outstanding principal ('simple') or principal + unpaid accrued interest
+ *     ('compound' — unpaid interest is capitalised, as a bank would).
+ *   - Penalties accrue PER DAY on the OVERDUE AMOUNT (the unpaid interest), not on
+ *     the whole principal, and only after `grace_period_days` have passed since the
+ *     interest was billed. Penalties stop the moment interest is cleared, so a
+ *     penalty never itself earns a penalty.
  *   - Payments apply as a waterfall: penalties → interest → principal.
+ *   - Interest keeps accruing past maturity_date BY DESIGN — a loan in default must
+ *     not stop costing the borrower. `getLoanStatement` flags `pastMaturity` so the
+ *     UI can say so.
  *
  * `rebuildLoan` is the ONLY thing that mutates a loan's balances. It throws away
  * all derived rows (accruals, penalties, ledger) and replays the loan's events
  * (period boundaries + payments) in strict chronological order from the original
- * principal. This makes the engine:
- *   - self-healing: any historically corrupted balance is recomputed correctly;
- *   - drift-free: edit/delete of a payment is just "change the row, then rebuild";
- *   - idempotent: running it any number of times yields the same state.
+ * principal.
  *
- * `rebuildLoan` does NOT open its own transaction — callers compose it inside one.
- * `accrueLoan` is the transactional public entry point.
+ * `rebuildLoan` does NOT open its own transaction — callers compose it inside one
+ * (`sql.begin`). `accrueLoan` is the transactional public entry point.
  */
 
 type Loan = any
+type Payment = { id?: number; payment_date: string; amount: number }
 
 const DAY_MS = 1000 * 60 * 60 * 24
+
+export const DEFAULT_GRACE_DAYS = 7
+export const BUSINESS_TIMEZONE = 'Asia/Manila'
+
+export function businessToday(now: Date = new Date()): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: BUSINESS_TIMEZONE,
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(now)
+}
 
 function addPeriods(date: Date, frequency: string, count: number): Date {
   const d = new Date(date)
   switch (frequency) {
     case 'weekly':
-      d.setDate(d.getDate() + 7 * count)
+      d.setUTCDate(d.getUTCDate() + 7 * count)
       break
     case 'biweekly':
-      d.setDate(d.getDate() + 14 * count)
+      d.setUTCDate(d.getUTCDate() + 14 * count)
       break
     case 'quarterly':
-      d.setMonth(d.getMonth() + 3 * count)
+      addMonths(d, 3 * count)
       break
     case 'monthly':
     default:
-      d.setMonth(d.getMonth() + count)
+      addMonths(d, count)
       break
   }
   return d
+}
+
+function addMonths(d: Date, months: number): void {
+  const targetDay = d.getUTCDate()
+  d.setUTCMonth(d.getUTCMonth() + months)
+  if (d.getUTCDate() < targetDay) d.setUTCDate(0)
 }
 
 function periodRate(annualRate: number, frequency: string): number {
@@ -73,38 +93,63 @@ function daysBetween(a: Date, b: Date): number {
   return Math.floor((b.getTime() - a.getTime()) / DAY_MS)
 }
 
+function addDays(d: Date, days: number): Date {
+  const out = new Date(d)
+  out.setUTCDate(out.getUTCDate() + days)
+  return out
+}
+
+function annuityPayment(owed: number, ratePerPeriod: number, periods: number): number {
+  if (periods <= 0) return owed
+  if (ratePerPeriod === 0) return owed / periods
+  const growth = Math.pow(1 + ratePerPeriod, periods)
+  return (owed * ratePerPeriod * growth) / (growth - 1)
+}
+
 type ReplayEvent =
   | { date: Date; kind: 'accrue'; order: number }
-  | { date: Date; kind: 'pay'; order: number; payment: any }
+  | { date: Date; kind: 'pay'; order: number; payment: Payment }
   | { date: Date; kind: 'end'; order: number }
 
+export type LoanReplayResult = {
+  balance: number
+  interestBalance: number
+  penaltyBalance: number
+  status: string
+  accruals: Array<{ accrued_interest: number; accrual_date: string; principal_balance: number }>
+  penalties: Array<{ penalty_amount: number; penalty_date: string; reason: string }>
+  ledger: Array<{
+    entry_date: string
+    entry_type: string
+    principal: number
+    interest: number
+    penalties: number
+    principal_balance: number
+    interest_balance: number
+    penalty_balance: number
+    notes: string | null
+  }>
+}
+
 /**
- * Recompute a loan's entire state from its original principal by replaying every
- * accrual and payment in chronological order. Must run inside a transaction.
+ * Pure replay — no DB I/O. Used by rebuildLoan and unit tests.
  */
-export function rebuildLoan(db: Database.Database, loanId: number, asOfDate: Date = new Date()): Loan {
-  const loan = db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId) as Loan
-  if (!loan) throw new Error('Loan not found')
-
+export function computeLoanReplay(
+  loan: Loan,
+  payments: Payment[],
+  asOfDate: Date = new Date()
+): LoanReplayResult {
   const frequency = loan.payment_frequency || 'monthly'
-  const rate = periodRate(loan.interest_rate, frequency)
-  const penaltyRate = (loan.penalty_per_day || 0) / 100
-  const disburse = new Date(loan.disbursement_date)
+  const rate = periodRate(num(loan.interest_rate), frequency)
+  const penaltyRate = num(loan.penalty_per_day) / 100
+  const graceDays = Math.max(0, loan.grace_period_days ?? DEFAULT_GRACE_DAYS)
+  const disburse = new Date(dateStr(loan.disbursement_date))
+  const compounding = (loan.interest_type || 'simple') === 'compound'
 
-  // Wipe all derived rows — they are regenerated below.
-  db.prepare('DELETE FROM interest_accruals WHERE loan_id = ?').run(loanId)
-  db.prepare('DELETE FROM penalties WHERE loan_id = ?').run(loanId)
-  db.prepare('DELETE FROM loan_ledger WHERE loan_id = ?').run(loanId)
-
-  let balance = money(loan.principal_amount || loan.loan_amount || 0)
+  let balance = money(num(loan.principal_amount || loan.loan_amount))
   let interestBalance = 0
   let penaltyBalance = 0
 
-  const payments = db
-    .prepare('SELECT * FROM payments WHERE loan_id = ? ORDER BY date(payment_date) ASC, id ASC')
-    .all(loanId) as any[]
-
-  // Build the event timeline.
   const events: ReplayEvent[] = []
   if (rate > 0) {
     for (let n = 1; ; n++) {
@@ -114,56 +159,78 @@ export function rebuildLoan(db: Database.Database, loanId: number, asOfDate: Dat
     }
   }
   for (const p of payments) {
-    events.push({ date: new Date(p.payment_date), kind: 'pay', order: 1, payment: p })
+    events.push({
+      date: new Date(dateStr(p.payment_date)),
+      kind: 'pay',
+      order: 1,
+      payment: { ...p, amount: num(p.amount) },
+    })
   }
-  // Same date: accrue (0) before pay (1) so a payment can settle that day's interest.
   events.sort((a, b) => a.date.getTime() - b.date.getTime() || a.order - b.order)
-  events.push({ date: asOfDate, kind: 'end', order: 2 }) // settle trailing penalty
+  events.push({ date: asOfDate, kind: 'end', order: 2 })
 
-  const insAccrual = db.prepare(`
-    INSERT INTO interest_accruals (loan_id, accrued_interest, accrual_date, principal_balance, daily_interest)
-    VALUES (?, ?, ?, ?, ?)
-  `)
-  const insPenalty = db.prepare(`
-    INSERT INTO penalties (loan_id, penalty_amount, penalty_date, reason, penalty_type, applied)
-    VALUES (?, ?, ?, ?, 'late', 1)
-  `)
-  const insLedger = db.prepare(`
-    INSERT INTO loan_ledger (
-      loan_id, entry_date, entry_type, principal, interest, penalties,
-      principal_balance, interest_balance, penalty_balance, notes
-    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-  `)
+  const accruals: LoanReplayResult['accruals'] = []
+  const penalties: LoanReplayResult['penalties'] = []
+  const ledger: LoanReplayResult['ledger'] = []
 
-  let inArrears = false
-  let segStart = disburse // start of the current (unbilled) penalty segment
+  let arrearsSince: Date | null = null
+  let segStart = disburse
 
   for (const e of events) {
-    // Charge per-day penalty for the gap [segStart, e.date] if overdue. Balance is
-    // constant across this gap (it only changes at pay events, which are boundaries).
-    if (inArrears && penaltyRate > 0 && balance > 0.005) {
-      const days = daysBetween(segStart, e.date)
+    if (arrearsSince && penaltyRate > 0 && interestBalance > 0.005) {
+      const chargeFrom = addDays(arrearsSince, graceDays)
+      const from = segStart.getTime() > chargeFrom.getTime() ? segStart : chargeFrom
+      const days = daysBetween(from, e.date)
       if (days > 0) {
-        const pen = money(balance * penaltyRate * days)
+        const pen = money(interestBalance * penaltyRate * days)
         if (pen > 0) {
           penaltyBalance = money(penaltyBalance + pen)
-          insPenalty.run(loanId, pen, dateOnly(e.date), `Late penalty: ${days} day(s) overdue on ₱${balance.toLocaleString()}`)
-          insLedger.run(loanId, dateOnly(e.date), 'penalty_charge', 0, 0, pen, balance, interestBalance, penaltyBalance, null)
+          penalties.push({
+            penalty_amount: pen,
+            penalty_date: dateOnly(e.date),
+            reason: `Late penalty: ${days} day(s) past the ${graceDays}-day grace on ₱${interestBalance.toLocaleString()} overdue interest`,
+          })
+          ledger.push({
+            entry_date: dateOnly(e.date),
+            entry_type: 'penalty_charge',
+            principal: 0,
+            interest: 0,
+            penalties: pen,
+            principal_balance: balance,
+            interest_balance: interestBalance,
+            penalty_balance: penaltyBalance,
+            notes: null,
+          })
         }
       }
     }
     segStart = e.date
 
     if (e.kind === 'accrue') {
-      if (balance > 0.005) {
-        const interest = money(balance * rate)
+      const base = compounding ? money(balance + interestBalance) : balance
+      if (base > 0.005) {
+        const interest = money(base * rate)
         if (interest > 0) {
           interestBalance = money(interestBalance + interest)
-          insAccrual.run(loanId, interest, dateOnly(e.date), balance, money((balance * (loan.interest_rate / 100)) / 365))
-          insLedger.run(loanId, dateOnly(e.date), 'interest_accrual', 0, interest, 0, balance, interestBalance, penaltyBalance, null)
+          accruals.push({
+            accrued_interest: interest,
+            accrual_date: dateOnly(e.date),
+            principal_balance: base,
+          })
+          ledger.push({
+            entry_date: dateOnly(e.date),
+            entry_type: 'interest_accrual',
+            principal: 0,
+            interest,
+            penalties: 0,
+            principal_balance: balance,
+            interest_balance: interestBalance,
+            penalty_balance: penaltyBalance,
+            notes: null,
+          })
         }
       }
-      if (interestBalance > 0.005) inArrears = true
+      if (interestBalance > 0.005 && !arrearsSince) arrearsSince = e.date
     } else if (e.kind === 'pay') {
       let remaining = money(e.payment.amount)
       const payPenalty = money(Math.min(remaining, penaltyBalance))
@@ -176,112 +243,215 @@ export function rebuildLoan(db: Database.Database, loanId: number, asOfDate: Dat
       interestBalance = money(interestBalance - payInterest)
       balance = money(balance - payPrincipal)
 
-      insLedger.run(
-        loanId,
-        dateOnly(e.date),
-        'payment',
-        payPrincipal,
-        payInterest,
-        payPenalty,
-        balance,
-        interestBalance,
-        penaltyBalance,
-        null
-      )
+      ledger.push({
+        entry_date: dateOnly(e.date),
+        entry_type: 'payment',
+        principal: payPrincipal,
+        interest: payInterest,
+        penalties: payPenalty,
+        principal_balance: balance,
+        interest_balance: interestBalance,
+        penalty_balance: penaltyBalance,
+        notes: null,
+      })
 
-      // Brought current → arrears clears.
-      if (isZero(interestBalance) && isZero(penaltyBalance)) inArrears = false
+      if (isZero(interestBalance)) arrearsSince = null
     }
   }
 
-  // Status: completed when fully paid; otherwise active. A manual 'defaulted'
-  // flag is preserved.
   let status = loan.status
   if (status !== 'defaulted') {
-    status = isZero(balance) && isZero(interestBalance) && isZero(penaltyBalance) ? 'completed' : 'active'
+    status =
+      isZero(balance) && isZero(interestBalance) && isZero(penaltyBalance) ? 'completed' : 'active'
   }
 
-  db.prepare('UPDATE loans SET balance = ?, interest_balance = ?, penalty_balance = ?, status = ?, updated_at = ? WHERE id = ?').run(
-    balance,
-    interestBalance,
-    penaltyBalance,
-    status,
-    new Date().toISOString(),
-    loanId
-  )
-
-  return db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId)
+  return { balance, interestBalance, penaltyBalance, status, accruals, penalties, ledger }
 }
 
-/**
- * Public transactional entry point: recompute a loan's interest, penalties and
- * status as of `asOfDate`. Safe to call on demand (idempotent / self-healing).
- */
-export function accrueLoan(loanId: number, asOfDate: Date = new Date()) {
-  const db = getDb()
-  return db.transaction(() => rebuildLoan(db, loanId, asOfDate))()
-}
+type Sql = typeof sql
 
 /**
- * Read-only period-by-period statement, derived entirely from the engine's own
- * accrual rows and balances (NOT a separate amortization model). This is what the
- * "amount due to stay current" card renders, so it always agrees with the
- * Financial Summary.
- *
- * "Due to stay current" = unpaid accrued interest + penalties (what the engine
- * actually treats as overdue). Principal is paid flexibly and is only fully due at
- * maturity, so it is not counted as overdue here. The `scheduledInstallment` is the
- * informational level payment that would clear the loan over its term.
+ * Persist a full replay for `loanId`. Must run inside a transaction when composed
+ * with other writes. Pass the transaction-scoped `sql` when inside `sql.begin`.
  */
-export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
-  const db = getDb()
-  const loan = db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId) as Loan
+export async function rebuildLoan(
+  loanId: number,
+  asOfDate: Date = new Date(),
+  db: Sql = sql
+): Promise<Loan> {
+  const [loan] = await db`SELECT * FROM loans WHERE id = ${loanId}`
   if (!loan) throw new Error('Loan not found')
+
+  const payments = await db`
+    SELECT * FROM payments
+    WHERE loan_id = ${loanId}
+    ORDER BY payment_date ASC, id ASC
+  `
+
+  const result = computeLoanReplay(loan, payments as Payment[], asOfDate)
+
+  await db`DELETE FROM interest_accruals WHERE loan_id = ${loanId}`
+  await db`DELETE FROM penalties WHERE loan_id = ${loanId}`
+  await db`DELETE FROM loan_ledger WHERE loan_id = ${loanId}`
+
+  for (const a of result.accruals) {
+    await db`
+      INSERT INTO interest_accruals (loan_id, accrued_interest, accrual_date, principal_balance)
+      VALUES (${loanId}, ${a.accrued_interest}, ${a.accrual_date}, ${a.principal_balance})
+    `
+  }
+  for (const p of result.penalties) {
+    await db`
+      INSERT INTO penalties (loan_id, penalty_amount, penalty_date, reason, penalty_type, applied)
+      VALUES (${loanId}, ${p.penalty_amount}, ${p.penalty_date}, ${p.reason}, 'late', true)
+    `
+  }
+  for (const l of result.ledger) {
+    await db`
+      INSERT INTO loan_ledger (
+        loan_id, entry_date, entry_type, principal, interest, penalties,
+        principal_balance, interest_balance, penalty_balance, notes
+      ) VALUES (
+        ${loanId}, ${l.entry_date}, ${l.entry_type}, ${l.principal}, ${l.interest}, ${l.penalties},
+        ${l.principal_balance}, ${l.interest_balance}, ${l.penalty_balance}, ${l.notes}
+      )
+    `
+  }
+
+  await db`
+    UPDATE loans SET
+      balance = ${result.balance},
+      interest_balance = ${result.interestBalance},
+      penalty_balance = ${result.penaltyBalance},
+      status = ${result.status},
+      updated_at = ${new Date().toISOString()}
+    WHERE id = ${loanId}
+  `
+
+  const [updated] = await db`SELECT * FROM loans WHERE id = ${loanId}`
+  return normalizeLoan(updated)
+}
+
+export function diffLoanChange(
+  before: Record<string, any>,
+  after: Record<string, any>
+): { oldValues: Record<string, any>; newValues: Record<string, any> } | null {
+  const oldValues: Record<string, any> = {}
+  const newValues: Record<string, any> = {}
+  for (const key of Object.keys(after)) {
+    if (key === 'updated_at') continue
+    if (before[key] !== after[key]) {
+      oldValues[key] = before[key] ?? null
+      newValues[key] = after[key]
+    }
+  }
+  if (Object.keys(newValues).length === 0) return null
+  return { oldValues, newValues }
+}
+
+export async function auditLoanChange(
+  loanId: number,
+  before: Record<string, any>,
+  after: Record<string, any>,
+  db: Sql = sql,
+  userId: string | null = null
+): Promise<void> {
+  const diff = diffLoanChange(before, after)
+  if (!diff) return
+  await db`
+    INSERT INTO audit_logs (table_name, record_id, action, old_values, new_values, user_id, created_at)
+    VALUES (
+      'loans',
+      ${loanId},
+      'UPDATE',
+      ${db.json(diff.oldValues)},
+      ${db.json(diff.newValues)},
+      ${userId},
+      ${new Date().toISOString()}
+    )
+  `
+}
+
+export function validatePaymentDate(value: string, now: Date = new Date()): string | null {
+  const d = new Date(value)
+  if (isNaN(d.getTime())) return 'Invalid payment date'
+  if (dateOnly(d) > businessToday(now)) return 'Payment date cannot be in the future'
+  return null
+}
+
+export async function accrueLoan(loanId: number, asOfDate: Date = new Date()) {
+  return sql.begin(async (tx) => rebuildLoan(loanId, asOfDate, tx as unknown as Sql))
+}
+
+function normalizeLoan(loan: any): Loan {
+  if (!loan) return loan
+  return {
+    ...loan,
+    principal_amount: num(loan.principal_amount),
+    loan_amount: num(loan.loan_amount),
+    balance: num(loan.balance),
+    interest_rate: num(loan.interest_rate),
+    penalty_per_day: num(loan.penalty_per_day),
+    interest_balance: num(loan.interest_balance),
+    penalty_balance: num(loan.penalty_balance),
+    grace_period_days: Number(loan.grace_period_days ?? DEFAULT_GRACE_DAYS),
+    loan_term_months: Number(loan.loan_term_months),
+    disbursement_date: dateStr(loan.disbursement_date),
+    maturity_date: dateStr(loan.maturity_date),
+  }
+}
+
+export async function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
+  const [raw] = await sql`SELECT * FROM loans WHERE id = ${loanId}`
+  if (!raw) throw new Error('Loan not found')
+  const loan = normalizeLoan(raw)
 
   const frequency = loan.payment_frequency || 'monthly'
   const rate = periodRate(loan.interest_rate, frequency)
   const disburse = new Date(loan.disbursement_date)
+  const graceDays = Math.max(0, loan.grace_period_days ?? DEFAULT_GRACE_DAYS)
 
   const balance = money(loan.balance || 0)
   const interestBalance = money(loan.interest_balance || 0)
   const penaltyBalance = money(loan.penalty_balance || 0)
+  const compounding = (loan.interest_type || 'simple') === 'compound'
+  const interestBase = compounding ? money(balance + interestBalance) : balance
 
-  // Each accrual row is one elapsed period boundary, with the principal it was
-  // charged on. Allocate interest paid (charged − still owed) oldest-first to mark
-  // which periods are settled vs still outstanding.
-  const accruals = db
-    .prepare('SELECT accrual_date, principal_balance, accrued_interest FROM interest_accruals WHERE loan_id = ? ORDER BY date(accrual_date) ASC')
-    .all(loanId) as any[]
-  const totalInterestCharged = money(accruals.reduce((s, a) => s + a.accrued_interest, 0))
+  const accruals = await sql`
+    SELECT accrual_date, principal_balance, accrued_interest
+    FROM interest_accruals
+    WHERE loan_id = ${loanId}
+    ORDER BY accrual_date ASC
+  `
+  const totalInterestCharged = money(
+    accruals.reduce((s: number, a: any) => s + num(a.accrued_interest), 0)
+  )
   let interestPaid = money(totalInterestCharged - interestBalance)
 
-  const periods = accruals.map((a, i) => {
-    const charged = money(a.accrued_interest)
+  const periods = accruals.map((a: any, i: number) => {
+    const charged = money(num(a.accrued_interest))
     const paid = money(Math.min(interestPaid, charged))
     interestPaid = money(interestPaid - paid)
     const remaining = money(charged - paid)
-    const chargedDate = new Date(a.accrual_date)
-    const past = chargedDate.getTime() < asOfDate.getTime()
+    const chargedDate = new Date(dateStr(a.accrual_date))
+    const dueBy = addDays(chargedDate, graceDays)
+    const past = dueBy.getTime() < asOfDate.getTime()
     const status = remaining > 0.005 ? (past ? 'overdue' : 'due') : 'paid'
-    // This charge covers the span from the previous boundary (or disbursement) to
-    // this boundary; it "appears" (is billed) on the boundary date.
-    const periodStart = i > 0 ? accruals[i - 1].accrual_date : dateOnly(disburse)
+    const periodStart = i > 0 ? dateStr(accruals[i - 1].accrual_date) : dateOnly(disburse)
     return {
-      date: a.accrual_date,
+      date: dateStr(a.accrual_date),
       periodStart,
-      chargedOn: a.accrual_date,
-      openingBalance: money(a.principal_balance),
+      chargedOn: dateStr(a.accrual_date),
+      openingBalance: money(num(a.principal_balance)),
       interestCharged: charged,
       interestPaid: paid,
       interestRemaining: remaining,
       status,
-      // Days a still-unpaid past charge has been overdue (since the day it was billed).
-      daysOverdue: status === 'overdue' ? Math.max(0, daysBetween(chargedDate, asOfDate)) : 0,
+      dueBy: dateOnly(dueBy),
+      daysOverdue: status === 'overdue' ? Math.max(0, daysBetween(dueBy, asOfDate)) : 0,
     }
   })
 
-  // Next upcoming boundary and the interest it will charge (projected on the
-  // current balance).
   let nextDueDate: Date | null = null
   for (let n = 1; n <= 600; n++) {
     const b = addPeriods(disburse, frequency, n)
@@ -290,11 +460,9 @@ export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
       break
     }
   }
-  const nextInterestCharge = nextDueDate && balance > 0.005 ? money(balance * rate) : 0
+  const nextInterestCharge = nextDueDate && interestBase > 0.005 ? money(interestBase * rate) : 0
 
-  // Merge interest charges and payments into one chronological timeline so the
-  // statement reads as a story: interest billed → payment made → interest billed …
-  const pb = getPaymentBreakdown(loanId)
+  const pb = await getPaymentBreakdown(loanId)
   const timeline = [
     ...periods.map((p) => ({ kind: 'interest' as const, sort: new Date(p.date).getTime(), tie: 0, ...p })),
     ...pb.items.map((p) => ({ kind: 'payment' as const, sort: new Date(p.date).getTime(), tie: 1, ...p })),
@@ -302,10 +470,17 @@ export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
 
   const amountDueToStayCurrent = money(interestBalance + penaltyBalance)
   const payoffToday = money(balance + interestBalance + penaltyBalance)
-  // The level installment that clears the original loan over its full term.
-  const suggestedMonthlyPayment = money(
-    calculateMonthlyPayment(loan.principal_amount || loan.loan_amount || 0, loan.interest_rate, loan.loan_term_months)
-  )
+
+  const maturity = loan.maturity_date ? new Date(loan.maturity_date) : null
+  const pastMaturity = Boolean(maturity && maturity.getTime() < asOfDate.getTime())
+  let remainingPeriods = 0
+  if (maturity) {
+    for (let n = 1; n <= 600; n++) {
+      if (addPeriods(disburse, frequency, n).getTime() > maturity.getTime()) break
+      if (addPeriods(disburse, frequency, n).getTime() > asOfDate.getTime()) remainingPeriods++
+    }
+  }
+  const suggestedMonthlyPayment = money(annuityPayment(payoffToday, rate, remainingPeriods))
 
   return {
     outstandingBalance: balance,
@@ -317,8 +492,17 @@ export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
     isOverdue: periods.some((p) => p.status === 'overdue') || penaltyBalance > 0.005,
     nextDueDate: nextDueDate ? dateOnly(nextDueDate) : null,
     nextInterestCharge,
-    // Interest charged per period on the CURRENT balance (what "interest per month" is right now).
-    monthlyInterest: money(balance * rate),
+    graceDays,
+    remainingPeriods,
+    pastMaturity,
+    labels: {
+      interestModel: compounding ? 'Compounding' : 'Reducing balance',
+      installment: pastMaturity
+        ? 'Past maturity — clears everything owed today in one payment.'
+        : `Clears everything owed today over the ${remainingPeriods} period(s) left to ${loan.maturity_date}.`,
+    },
+    monthlyInterest: money(interestBase * rate),
+    interestType: compounding ? 'compound' : 'simple',
     suggestedMonthlyPayment,
     scheduledInstallment: suggestedMonthlyPayment,
     monthlyRatePct: money(loan.interest_rate / 12),
@@ -329,41 +513,38 @@ export function getLoanStatement(loanId: number, asOfDate: Date = new Date()) {
   }
 }
 
-/**
- * Read-only per-payment breakdown: for each payment, how much went to penalties,
- * interest and principal (the waterfall split), plus the balance left afterward.
- * Derived from the ledger rows the rebuild already wrote (one 'payment' row per
- * payment, in chronological order), joined to the payments table for metadata.
- */
-export function getPaymentBreakdown(loanId: number) {
-  const db = getDb()
-
-  const payments = db
-    .prepare('SELECT id, payment_date, amount, payment_method, reference_number FROM payments WHERE loan_id = ? ORDER BY date(payment_date) ASC, id ASC')
-    .all(loanId) as any[]
-  const ledgerPays = db
-    .prepare("SELECT entry_date, principal, interest, penalties, principal_balance, interest_balance, penalty_balance FROM loan_ledger WHERE loan_id = ? AND entry_type = 'payment' ORDER BY id ASC")
-    .all(loanId) as any[]
+export async function getPaymentBreakdown(loanId: number) {
+  const payments = await sql`
+    SELECT id, payment_date, amount, payment_method, reference_number
+    FROM payments
+    WHERE loan_id = ${loanId}
+    ORDER BY payment_date ASC, id ASC
+  `
+  const ledgerPays = await sql`
+    SELECT entry_date, principal, interest, penalties, principal_balance, interest_balance, penalty_balance
+    FROM loan_ledger
+    WHERE loan_id = ${loanId} AND entry_type = 'payment'
+    ORDER BY id ASC
+  `
 
   let totalToInterest = 0
   let totalToPrincipal = 0
   let totalToPenalty = 0
 
-  const items = payments.map((p, i) => {
+  const items = payments.map((p: any, i: number) => {
     const l = ledgerPays[i] || {}
-    const toPenalty = money(l.penalties || 0)
-    const toInterest = money(l.interest || 0)
-    const toPrincipal = money(l.principal || 0)
-    // What was outstanding right BEFORE this payment = what it paid + what remained after.
-    const interestDueBefore = money(toInterest + (l.interest_balance || 0))
-    const penaltyDueBefore = money(toPenalty + (l.penalty_balance || 0))
+    const toPenalty = money(num(l.penalties))
+    const toInterest = money(num(l.interest))
+    const toPrincipal = money(num(l.principal))
+    const interestDueBefore = money(toInterest + num(l.interest_balance))
+    const penaltyDueBefore = money(toPenalty + num(l.penalty_balance))
     totalToInterest = money(totalToInterest + toInterest)
     totalToPrincipal = money(totalToPrincipal + toPrincipal)
     totalToPenalty = money(totalToPenalty + toPenalty)
     return {
       id: p.id,
-      date: p.payment_date,
-      amount: money(p.amount),
+      date: dateStr(p.payment_date),
+      amount: money(num(p.amount)),
       method: p.payment_method,
       reference: p.reference_number,
       toPenalty,
@@ -371,9 +552,8 @@ export function getPaymentBreakdown(loanId: number) {
       toPrincipal,
       interestDueBefore,
       penaltyDueBefore,
-      // True when the payment was fully consumed by interest/penalties (nothing left for principal).
       fullyConsumedByInterest: toPrincipal <= 0.005 && toInterest > 0.005,
-      balanceAfter: money(l.principal_balance || 0),
+      balanceAfter: money(num(l.principal_balance)),
     }
   })
 
@@ -386,31 +566,27 @@ export function getPaymentBreakdown(loanId: number) {
   }
 }
 
-/**
- * Read-only loan summary for display. Performs NO writes — call `accrueLoan`
- * (the accrue route) first so GETs stay idempotent.
- */
-export function getLoanSummary(loanId: number) {
-  const db = getDb()
-  const loan = db.prepare('SELECT * FROM loans WHERE id = ?').get(loanId) as Loan
-  if (!loan) throw new Error('Loan not found')
+export async function getLoanSummary(loanId: number) {
+  const [raw] = await sql`SELECT * FROM loans WHERE id = ${loanId}`
+  if (!raw) throw new Error('Loan not found')
+  const loan = normalizeLoan(raw)
 
-  const payments = db.prepare('SELECT amount FROM payments WHERE loan_id = ?').all(loanId) as any[]
-  const totalPaid = money(payments.reduce((sum, p) => sum + p.amount, 0))
+  const payments = await sql`SELECT amount FROM payments WHERE loan_id = ${loanId}`
+  const totalPaid = money(payments.reduce((sum: number, p: any) => sum + num(p.amount), 0))
 
   const balance = money(loan.balance || 0)
   const interestBalance = money(loan.interest_balance || 0)
   const penaltyBalance = money(loan.penalty_balance || 0)
 
-  const statement = getLoanStatement(loanId)
-  const paymentBreakdown = getPaymentBreakdown(loanId)
+  const statement = await getLoanStatement(loanId)
+  const paymentBreakdown = await getPaymentBreakdown(loanId)
 
   return {
     loanAmount: loan.loan_amount,
     balance,
     totalPaid,
     paymentBreakdown,
-    accruredInterest: interestBalance, // (key name kept for UI compatibility)
+    accruredInterest: interestBalance,
     accruedInterest: interestBalance,
     penalties: penaltyBalance,
     dueAmount: money(interestBalance + penaltyBalance),
@@ -421,12 +597,13 @@ export function getLoanSummary(loanId: number) {
     disbursementDate: loan.disbursement_date,
     statement,
     calculationNotes: {
-      // Unpaid interest carried forward — NOT balance × rate (that's next month's charge).
       interestFormula:
         interestBalance > 0.005
           ? `Unpaid accrued interest carried forward`
           : `Fully paid — next charge ₱${statement.nextInterestCharge.toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${statement.nextDueDate ? ` on ${statement.nextDueDate}` : ''}`,
-      monthlyRate: `${(loan.interest_rate / 12).toFixed(2)}% monthly (reducing balance)`,
+      monthlyRate: `${(loan.interest_rate / 12).toFixed(2)}% monthly (${
+        statement.interestType === 'compound' ? 'compounded on unpaid balance' : 'reducing balance'
+      })`,
     },
   }
 }

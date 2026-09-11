@@ -7,8 +7,8 @@ describe('loan report data', () => {
     expect(slugifyBorrowerName('María Dela Cruz')).toBe('maria-dela-cruz')
   })
 
-  it('maps the current loan ledger without recomputing financial values', () => {
-    const report = buildLoanReportData(3, new Date('2026-07-15T00:00:00+08:00'))
+  it('maps the current loan ledger without recomputing financial values', async () => {
+    const report = await buildLoanReportData(3, new Date('2026-07-15T00:00:00+08:00'))
 
     expect(report.loanId).toBe(3)
     expect(report.borrower).toMatchObject({
