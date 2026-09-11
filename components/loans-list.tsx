@@ -1,8 +1,8 @@
-import Link from 'next/link'
 import { Card } from '@/components/ui/card'
 import { Badge } from '@/components/ui/badge'
 import { Button } from '@/components/ui/button'
 import { ArrowRight } from 'lucide-react'
+import { TransitionLink } from '@/components/transition-link'
 
 interface LoansListProps {
   loans: any[]
@@ -25,60 +25,54 @@ export default function LoansList({ loans }: LoansListProps) {
   }
 
   return (
-    <Card className="p-6">
-      <div className="flex items-center justify-between mb-6">
+    <Card className="p-5 sm:p-6">
+      <div className="flex items-center justify-between mb-6 gap-3">
         <h2 className="text-lg font-semibold text-foreground">Recent Loans</h2>
-        <Link href="/loans">
-          <Button variant="ghost" size="sm" className="gap-2">
-            View All <ArrowRight className="w-4 h-4" />
+        <TransitionLink href="/loans" transition="forward">
+          <Button variant="ghost" size="sm" className="gap-2 min-h-10">
+            View All <ArrowRight className="w-4 h-4" aria-hidden="true" />
           </Button>
-        </Link>
+        </TransitionLink>
       </div>
 
-      <div className="space-y-4">
+      <div className="space-y-3 stagger-in">
         {recentLoans.length > 0 ? (
           recentLoans.map((loan) => (
-            <Link
+            <TransitionLink
               key={loan.id}
               href={`/loans/${loan.id}`}
-              className="block p-4 rounded-lg border border-border hover:border-primary hover:bg-muted transition"
+              className="block p-4 rounded-lg border border-border hover:border-primary hover:bg-muted/60 transition-[border-color,background-color] duration-200"
             >
-              <div className="flex items-center justify-between mb-2">
-                <h3 className="font-semibold text-foreground">
+              <div className="flex items-center justify-between mb-2 gap-3">
+                <h3 className="font-semibold text-foreground truncate min-w-0">
                   {loan.borrower?.first_name} {loan.borrower?.last_name}
                 </h3>
-                <Badge className={getStatusColor(loan.status)}>
+                <Badge className={`${getStatusColor(loan.status)} shrink-0`}>
                   {loan.status?.charAt(0).toUpperCase() + loan.status?.slice(1)}
                 </Badge>
               </div>
               <div className="grid grid-cols-2 gap-4 text-sm">
-                <div>
+                <div className="min-w-0">
                   <p className="text-muted-foreground">Loan Amount</p>
-                  <p className="font-semibold text-foreground">₱{loan.loan_amount?.toLocaleString()}</p>
+                  <p className="font-semibold text-foreground tabular-nums truncate">
+                    ₱{Number(loan.loan_amount || 0).toLocaleString()}
+                  </p>
                 </div>
-                <div>
+                <div className="min-w-0">
                   <p className="text-muted-foreground">Outstanding Balance</p>
-                  <p className="font-semibold text-foreground">₱{loan.balance?.toLocaleString()}</p>
-                </div>
-                <div>
-                  <p className="text-muted-foreground">Interest Rate</p>
-                  <p className="font-semibold text-foreground">{loan.interest_rate / 12}% monthly</p>
-                </div>
-                <div>
-                  <p className="text-muted-foreground">Due Date</p>
-                  <p className="font-semibold text-foreground">
-                    {new Date(loan.created_at).toLocaleDateString('en-PH')}
+                  <p className="font-semibold text-foreground tabular-nums truncate">
+                    ₱{Number(loan.balance || 0).toLocaleString()}
                   </p>
                 </div>
               </div>
-            </Link>
+            </TransitionLink>
           ))
         ) : (
-          <div className="py-8 text-center">
-            <p className="text-muted-foreground">No loans yet</p>
-            <Link href="/loans/new">
-              <Button className="mt-4">Create First Loan</Button>
-            </Link>
+          <div className="text-center py-8">
+            <p className="text-muted-foreground mb-3">No loans yet</p>
+            <TransitionLink href="/loans/new">
+              <Button className="min-h-11">Create a Loan</Button>
+            </TransitionLink>
           </div>
         )}
       </div>

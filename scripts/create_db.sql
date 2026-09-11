@@ -24,6 +24,7 @@ CREATE TABLE loans (
   principal_amount REAL NOT NULL,
   interest_rate REAL NOT NULL,
   interest_type TEXT DEFAULT 'simple',
+  grace_period_days INTEGER NOT NULL DEFAULT 7,
   loan_term_months INTEGER NOT NULL,
   disbursement_date DATE NOT NULL,
   maturity_date DATE NOT NULL,
@@ -39,7 +40,6 @@ CREATE TABLE interest_accruals (
   loan_id INTEGER NOT NULL REFERENCES loans(id) ON DELETE CASCADE,
   accrual_date DATE NOT NULL,
   principal_balance REAL NOT NULL,
-  daily_interest REAL NOT NULL,
   accrued_interest REAL NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(loan_id, accrual_date)

@@ -15,4 +15,11 @@ node_modules
 .next/
 .DS_Store
 db.sqlite
+db.sqlite-shm
+db.sqlite-wal
 db/
+.vercel
+output/
+tmp/
+tsconfig.tsbuildinfo
+.claude/

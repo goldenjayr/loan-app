@@ -165,7 +165,7 @@ export async function renderLoanReportPdf(data: LoanReportData): Promise<Uint8Ar
   y = section(p1, 'Payment Options', y, fonts)
   y = table(p1, ['OPTION', 'AMOUNT', 'WHAT IT DOES'], [
     ['Minimum - interest only', `${money(statement.monthlyInterest)} / month`, "Covers this period's interest; principal remains unchanged."],
-    ['Recommended installment', `${money(statement.scheduledInstallment)} / month`, `Estimated payment to clear the loan over ${statement.termMonths} months.`],
+    ['Recommended installment', `${money(statement.scheduledInstallment)} / month`, statement.labels.installment],
     ['Pay off in full today', money(statement.payoffToday), 'Clears principal, accrued interest, and penalties.'],
   ], y, [145, 135, 227], fonts)
   y -= 20
@@ -179,8 +179,15 @@ export async function renderLoanReportPdf(data: LoanReportData): Promise<Uint8Ar
 
   // Page 2: complete chronological statement.
   const p2 = pages[1]
-  title(p2, 'Interest Statement', `Reducing-balance schedule - ${statement.periods.length} periods`, fonts)
-  text(p2, 'Interest is charged on the remaining principal. Paid periods are settled; overdue periods remain outstanding.', MARGIN, 738, fonts.regular, 9, INK, CONTENT_WIDTH)
+  const compounding = data.terms.interestType === 'compound'
+  title(p2, 'Interest Statement', `${statement.labels.interestModel} schedule - ${statement.periods.length} periods`, fonts)
+  text(
+    p2,
+    compounding
+      ? 'Interest is charged on the unpaid balance - remaining principal plus any interest still owed, so unpaid interest is added to the base. Paid periods are settled; overdue periods remain outstanding.'
+      : 'Interest is charged on the remaining principal. Paid periods are settled; overdue periods remain outstanding.',
+    MARGIN, 738, fonts.regular, 9, INK, CONTENT_WIDTH
+  )
   const timelineRows = statement.timeline.map((item: any) => item.kind === 'payment'
     ? [reportDate(item.date), 'PAYMENT', `Interest ${money(item.toInterest)} | Principal ${money(item.toPrincipal)}`, `Paid ${money(item.amount)}`, `Balance ${money(item.balanceAfter)}`]
     : [reportDate(item.date), String(item.status).toUpperCase(), `Opening ${money(item.openingBalance)} | ${reportDate(item.periodStart)}-${reportDate(item.date)}`, `Charged ${money(item.interestCharged)} | Paid ${money(item.interestPaid)}`, money(item.interestRemaining)])
