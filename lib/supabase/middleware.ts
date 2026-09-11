@@ -29,8 +29,9 @@ export async function updateSession(request: NextRequest) {
 
   const path = request.nextUrl.pathname
   const isAuthRoute = path.startsWith('/auth')
+  const isPublicShare = path.startsWith('/share/')
 
-  if (!user && !isAuthRoute) {
+  if (!user && !isAuthRoute && !isPublicShare) {
     const url = request.nextUrl.clone()
     url.pathname = '/auth/login'
     return NextResponse.redirect(url)

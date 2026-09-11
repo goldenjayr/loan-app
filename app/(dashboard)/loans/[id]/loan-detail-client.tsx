@@ -25,6 +25,7 @@ import { toast } from 'sonner'
 import { useRouter } from 'next/navigation'
 import { downloadLoanReport } from '@/lib/download-report'
 import Link from 'next/link'
+import { LoanShareControls } from '@/components/loan-share-controls'
 
 type Props = {
   loanId: string
@@ -569,6 +570,10 @@ export default function LoanDetailClient({ loanId, loan, payments, summary }: Pr
               </details>
             </div>
           </Card>
+        </div>
+
+        <div className="mb-6">
+          <LoanShareControls loanId={loanId} />
         </div>
 
         <div className="grid lg:grid-cols-3 gap-8">

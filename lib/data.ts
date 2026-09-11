@@ -19,6 +19,7 @@ function mapLoan(row: any) {
           first_name: row.borrower_first_name,
           last_name: row.borrower_last_name,
           email: row.borrower_email,
+          phone: row.borrower_phone ?? null,
         }
       : null,
   }
@@ -31,7 +32,8 @@ export const listLoans = cache(async () => {
       l.*,
       b.first_name AS borrower_first_name,
       b.last_name AS borrower_last_name,
-      b.email AS borrower_email
+      b.email AS borrower_email,
+      b.phone AS borrower_phone
     FROM loans l
     LEFT JOIN borrowers b ON l.borrower_id = b.id
     ORDER BY l.created_at DESC
@@ -54,7 +56,8 @@ export const getLoan = cache(async (id: number) => {
       l.*,
       b.first_name AS borrower_first_name,
       b.last_name AS borrower_last_name,
-      b.email AS borrower_email
+      b.email AS borrower_email,
+      b.phone AS borrower_phone
     FROM loans l
     LEFT JOIN borrowers b ON l.borrower_id = b.id
     WHERE l.id = ${id}
@@ -94,7 +97,8 @@ export const listLoansForBorrower = cache(async (borrowerId: number) => {
       l.*,
       b.first_name AS borrower_first_name,
       b.last_name AS borrower_last_name,
-      b.email AS borrower_email
+      b.email AS borrower_email,
+      b.phone AS borrower_phone
     FROM loans l
     LEFT JOIN borrowers b ON l.borrower_id = b.id
     WHERE l.borrower_id = ${borrowerId}
@@ -114,4 +118,14 @@ export async function loadLoanDetail(loanId: number) {
     getLoanSummary(loanId),
   ])
   return { loan, payments, summary }
+}
+
+/** Public share: resolve token then load the same detail payload. */
+export async function loadSharedLoanDetail(token: string) {
+  const { resolveShareToken } = await import('@/lib/share-links')
+  const link = await resolveShareToken(token)
+  if (!link) return null
+  const detail = await loadLoanDetail(link.loan_id)
+  if (!detail.loan) return null
+  return { ...detail, shareToken: link.token }
 }
